@@ -24,6 +24,9 @@ class SignalEngine:
         # State tracker references (for deployer spam check)
         self.tracker = state_tracker
         self.sol_tracker = sol_state_tracker
+        # Persistent record of every signaled token + mcap at signal time
+        # (survives eviction — used by volume scanner for "previously signaled" context)
+        self.signaled_history: dict[str, float] = {}  # token_addr -> mcap_at_signal
         # Anti-spam: track signals per hour
         self._signal_timestamps: list[float] = []
         # Stats
@@ -152,6 +155,7 @@ class SignalEngine:
         state.signal_time = now
         self._signal_timestamps.append(now)
         self.total_signaled += 1
+        self.signaled_history[state.token_address] = mcap
 
         # Track time-to-signal (pool creation → signal fire)
         self._signal_latencies.append(time_to_signal)

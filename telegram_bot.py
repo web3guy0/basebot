@@ -376,6 +376,7 @@ class SignalBot:
         has_socials = alert.get("has_socials", False)
         age_hours = alert.get("age_hours", 0)
         chain = alert.get("chain", "base")
+        signal_mcap = alert.get("signal_mcap")
 
         # Age formatting
         if age_hours < 1:
@@ -395,7 +396,15 @@ class SignalBot:
         else:
             trend = "➡️"
 
-        name_tag = f" ${symbol}" if symbol else ""
+        # Header: show name + symbol
+        if name and symbol:
+            name_tag = f" {name} (${symbol})"
+        elif symbol:
+            name_tag = f" ${symbol}"
+        elif name:
+            name_tag = f" {name}"
+        else:
+            name_tag = ""
         social_tag = " ✅" if has_socials else " ⚠️no-socials"
 
         if chain == "solana":
@@ -414,6 +423,12 @@ class SignalBot:
             ]
         }
 
+        # Build signal history line if bot previously caught this token
+        signal_line = ""
+        if signal_mcap is not None:
+            multiplier = mcap / signal_mcap if signal_mcap > 0 else 0
+            signal_line = f"\n├ 📍 Bot signaled at ${signal_mcap:,.0f} (<b>{multiplier:.1f}x</b> since)"
+
         message = (
             f"{trend} <b>PUMP DETECTED</b>{name_tag}{social_tag}\n"
             f"{'━' * 28}\n\n"
@@ -424,6 +439,7 @@ class SignalBot:
             f"├ Δ5m: <b>{price_change_m5:+.1f}%</b> · Δ1h: {price_change_h1:+.1f}%\n"
             f"├ Swaps/2m: <b>{swaps}</b>\n"
             f"└ Age: {age_str}"
+            f"{signal_line}"
         )
         await self._send_message(message, reply_markup=keyboard)
 

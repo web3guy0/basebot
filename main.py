@@ -188,6 +188,7 @@ class SignalDetector:
         self.volume_scanner = VolumeScanner(
             alert_queue=self._pump_queue,
             dex_client=self._shared_dex_client,
+            signaled_history=self.engine.signaled_history,
         ) if config.VOLUME_SPIKE_ENABLED else None
 
         self.w3 = None

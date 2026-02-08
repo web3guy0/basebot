@@ -27,9 +27,10 @@ SPIKE_WINDOW_S = 120         # Rolling window (seconds) for counting swaps
 MIN_SWAPS_FOR_SPIKE = 25     # Min swaps in window to trigger (high bar = real spikes only)
 COOLDOWN_S = 1800            # 30 min between alerts per pool
 MAX_TRACKED_POOLS = 10_000   # Memory cap: drop least-active pools beyond this
-PAIR_MIN_AGE_MS = 3_600_000  # 1 hour — truly established tokens only
+PAIR_MIN_AGE_MS = 86_400_000   # 1 day — skip tokens <24h (handled by signal pipeline)
+PAIR_MAX_AGE_MS = 15 * 86_400_000  # 15 days — skip established tokens, focus on memes
 PAIR_MIN_LIQ_USD = 5_000     # Skip dust pools
-PAIR_MAX_MCAP_USD = 5_000_000  # Skip large-caps (WETH/cbBTC/ZORA etc: not "pumps")
+PAIR_MAX_MCAP_USD = 2_000_000  # Skip large-caps (not meme pumps)
 PAIR_MIN_MCAP_USD = 1_000    # Skip dead tokens
 
 # Known base-layer tokens whose V3 pools always have high swap frequency.
@@ -50,17 +51,19 @@ _SKIP_TOKENS = {
 class VolumeScanner:
     """Detects volume spikes across all V3 pools by swap frequency."""
 
-    def __init__(self, alert_queue: asyncio.Queue, dex_client, new_token_pools: set | None = None):
+    def __init__(self, alert_queue: asyncio.Queue, dex_client, new_token_pools: set | None = None, signaled_history: dict | None = None):
         """
         Args:
             alert_queue: Queue to push spike alert dicts into (consumed by TG bot).
             dex_client: Shared DexScreenerClient for enrichment.
             new_token_pools: Live reference to the set of pool addrs already tracked
                              as new tokens — spikes on these are skipped.
+            signaled_history: Live reference to engine.signaled_history {token_addr: signal_mcap}.
         """
         self.alert_queue = alert_queue
         self.dex_client = dex_client
         self._new_token_pools = new_token_pools if new_token_pools is not None else set()
+        self._signaled_history = signaled_history if signaled_history is not None else {}
 
         # pool_addr -> list of swap timestamps (rolling window)
         self._swaps: dict[str, list[float]] = defaultdict(list)
@@ -155,6 +158,10 @@ class VolumeScanner:
             if pair_created and time.time() * 1000 - pair_created < PAIR_MIN_AGE_MS:
                 return
 
+            # Skip old established tokens — focus on meme-age tokens (≤15 days)
+            if pair_created and time.time() * 1000 - pair_created > PAIR_MAX_AGE_MS:
+                return
+
             # Skip dust / dead pools
             if liq < PAIR_MIN_LIQ_USD:
                 return
@@ -193,6 +200,7 @@ class VolumeScanner:
                 "swaps_2m": swap_count,
                 "has_socials": has_socials,
                 "age_hours": age_hours,
+                "signal_mcap": self._signaled_history.get(token_addr.lower()),
             }
 
             await self.alert_queue.put(alert)
