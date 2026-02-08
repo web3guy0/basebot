@@ -276,11 +276,9 @@ class SolanaListener:
 
         self.pools_detected += 1
 
-        logger.info(
-            f"[sol-pool] New Raydium pool | token={token_mint[:8]}... | "
-            f"liq={init_sol:.2f} SOL (${liquidity_usd:,.0f}) | "
-            f"deployer={deployer[:8]}... | "
-            f"sig={signature[:16]}..."
+        logger.debug(
+            f"[sol-pool] {token_mint[:8]}.. liq={init_sol:.1f}SOL(${liquidity_usd:,.0f}) "
+            f"deployer={deployer[:8]}.. sig={signature[:12]}.."
         )
 
         # ── Create token state ────────────────────────────────

@@ -39,6 +39,13 @@ class TokenState:
     ds_volume_m5: float | None = None
     ds_last_fetch: float = 0.0
 
+    # Token identity (from DexScreener)
+    token_name: str = ""
+    token_symbol: str = ""
+    has_socials: bool = False       # has twitter/telegram/website
+    pair_created_at: float = 0.0    # unix ms from DexScreener
+    is_copycat: bool = False        # flagged as name-copycat of established token
+
     # Safety
     bytecode_safe: bool | None = None  # None = not checked yet
     is_honeypot: bool | None = None
@@ -49,6 +56,10 @@ class TokenState:
 
     # Swap timestamps for momentum detection
     recent_buy_times: list = field(default_factory=list)
+    recent_sell_times: list = field(default_factory=list)
+
+    # Dump alert state
+    dump_alerted: bool = False
 
     @property
     def age_seconds(self) -> float:
@@ -135,9 +146,10 @@ class TokenStateTracker:
             deployer_address=deployer.lower() if deployer else "",
         )
         self.states[addr] = state
-        logger.info(
-            f"[new-token] {dex_version} | {addr[:10]}... | pair={pair_address[:10]}..."
-        )
+        hooks_tag = ""
+        if hooks_address and not hooks_address.endswith('0' * 40):
+            hooks_tag = f" hooks={hooks_address[:10]}.."
+        logger.info(f"[+] {dex_version} {addr[:12]}..{hooks_tag}")
         return state
 
     def record_buy(
@@ -167,6 +179,11 @@ class TokenStateTracker:
         if state is None:
             return None
         state.total_sells += 1
+        now = time.time()
+        state.recent_sell_times.append(now)
+        # Keep last 60s of sell timestamps
+        cutoff = now - 60
+        state.recent_sell_times = [t for t in state.recent_sell_times if t > cutoff]
         return state
 
     def record_deployer(self, deployer: str, token_address: str) -> int:

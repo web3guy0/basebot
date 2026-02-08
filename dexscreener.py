@@ -92,6 +92,16 @@ class DexScreenerClient:
             return data
         return []
 
+    async def search_pairs(self, query: str) -> list[dict]:
+        """Search for pairs matching a query (symbol, name, address).
+        Returns list of pair objects sorted by relevance.
+        Rate limit: 300 req/min."""
+        url = f"{BASE_URL}/latest/dex/search?q={query}"
+        data = await self._rate_limited_get(url)
+        if data and "pairs" in data:
+            return data["pairs"]
+        return []
+
 
 class DexScreenerEnricher:
     """
@@ -170,6 +180,21 @@ class DexScreenerEnricher:
             volume = best_pair.get("volume", {})
             state.ds_volume_m5 = volume.get("m5")
 
+            # Token identity (first enrichment only)
+            if not state.token_symbol:
+                base_token = best_pair.get("baseToken", {})
+                state.token_name = base_token.get("name", "")
+                state.token_symbol = base_token.get("symbol", "")
+                state.pair_created_at = best_pair.get("pairCreatedAt", 0)
+                info = best_pair.get("info", {})
+                socials = info.get("socials", [])
+                websites = info.get("websites", [])
+                state.has_socials = bool(socials or websites)
+
+                # Copycat check: search for this symbol across all chains
+                if state.token_symbol and not state.is_copycat:
+                    await self._check_copycat(state, best_pair)
+
             state.ds_last_fetch = time.time()
 
             logger.debug(
@@ -179,6 +204,65 @@ class DexScreenerEnricher:
 
             # Re-evaluate signal with enriched data
             await self.engine.evaluate(state)
+
+    async def _check_copycat(self, state, our_pair: dict):
+        """Check if token symbol is a copycat of an established token.
+        
+        Logic: search DexScreener for the symbol. If any OTHER token with
+        the same symbol has >10x our liquidity, or has verified socials
+        while we don't, flag as copycat.
+        """
+        try:
+            results = await self.client.search_pairs(state.token_symbol)
+            if not results:
+                return
+
+            our_liq = (our_pair.get("liquidity") or {}).get("usd", 0)
+            our_addr = state.token_address.lower()
+
+            for pair in results:
+                base = pair.get("baseToken", {})
+                # Must match symbol exactly (case-insensitive)
+                if base.get("symbol", "").upper() != state.token_symbol.upper():
+                    continue
+                # Skip our own token
+                if base.get("address", "").lower() == our_addr:
+                    continue
+                # Check if this other token is established
+                other_liq = (pair.get("liquidity") or {}).get("usd", 0)
+                other_mcap = pair.get("marketCap") or pair.get("fdv") or 0
+                other_info = pair.get("info", {})
+                other_socials = bool(other_info.get("socials") or other_info.get("websites"))
+
+                # Rule 1: other token has 10x+ our liquidity → copycat
+                if our_liq > 0 and other_liq > our_liq * 10:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] {state.token_symbol} {our_addr[:12]}.. "
+                        f"liq=${our_liq:,.0f} vs ${other_liq:,.0f} on {pair.get('chainId', '?')}"
+                    )
+                    return
+
+                # Rule 2: other token has socials + >2x liq, we don't → copycat
+                if other_socials and not state.has_socials and other_liq > our_liq * 2:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] {state.token_symbol} {our_addr[:12]}.. "
+                        f"no socials, original has verified profile"
+                    )
+                    return
+
+                # Rule 3: other token has >$100k mcap → well-established, we're fake
+                if other_mcap > 100_000 and our_liq < 50_000:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] {state.token_symbol} {our_addr[:12]}.. "
+                        f"original mcap=${other_mcap:,.0f}"
+                    )
+                    return
+
+        except Exception as e:
+            logger.debug(f"Copycat check failed for {state.token_symbol}: {e}")
 
 
 class SolDexScreenerEnricher:
@@ -261,6 +345,21 @@ class SolDexScreenerEnricher:
             volume = best_pair.get("volume", {})
             state.ds_volume_m5 = volume.get("m5")
 
+            # Token identity (first enrichment only)
+            if not state.token_symbol:
+                base_token = best_pair.get("baseToken", {})
+                state.token_name = base_token.get("name", "")
+                state.token_symbol = base_token.get("symbol", "")
+                state.pair_created_at = best_pair.get("pairCreatedAt", 0)
+                info = best_pair.get("info", {})
+                socials = info.get("socials", [])
+                websites = info.get("websites", [])
+                state.has_socials = bool(socials or websites)
+
+                # Copycat check
+                if state.token_symbol and not state.is_copycat:
+                    await self._check_copycat_sol(state, best_pair)
+
             state.ds_last_fetch = time.time()
 
             logger.debug(
@@ -270,3 +369,46 @@ class SolDexScreenerEnricher:
             )
 
             await self.engine.evaluate(state)
+
+    async def _check_copycat_sol(self, state, our_pair: dict):
+        """Copycat check for Solana tokens (same logic as EVM)."""
+        try:
+            results = await self.client.search_pairs(state.token_symbol)
+            if not results:
+                return
+
+            our_liq = (our_pair.get("liquidity") or {}).get("usd", 0)
+            our_addr = state.token_address.lower()
+
+            for pair in results:
+                base = pair.get("baseToken", {})
+                if base.get("symbol", "").upper() != state.token_symbol.upper():
+                    continue
+                if base.get("address", "").lower() == our_addr:
+                    continue
+                other_liq = (pair.get("liquidity") or {}).get("usd", 0)
+                other_mcap = pair.get("marketCap") or pair.get("fdv") or 0
+                other_info = pair.get("info", {})
+                other_socials = bool(other_info.get("socials") or other_info.get("websites"))
+
+                if our_liq > 0 and other_liq > our_liq * 10:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] sol {state.token_symbol} {our_addr[:12]}.. "
+                        f"liq=${our_liq:,.0f} vs ${other_liq:,.0f}"
+                    )
+                    return
+                if other_socials and not state.has_socials and other_liq > our_liq * 2:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] sol {state.token_symbol} no socials vs verified"
+                    )
+                    return
+                if other_mcap > 100_000 and our_liq < 50_000:
+                    state.is_copycat = True
+                    logger.info(
+                        f"[copycat] sol {state.token_symbol} original mcap=${other_mcap:,.0f}"
+                    )
+                    return
+        except Exception as e:
+            logger.debug(f"Copycat check failed for {state.token_symbol}: {e}")

@@ -58,12 +58,23 @@ class SolTokenState:
     ds_volume_m5: float | None = None
     ds_last_fetch: float = 0.0
 
+    # ── Token identity (from DexScreener) ───────────────────
+    token_name: str = ""
+    token_symbol: str = ""
+    has_socials: bool = False
+    pair_created_at: float = 0.0
+    is_copycat: bool = False
+
     # ── Signal state ────────────────────────────────────────
     signaled: bool = False
     signal_time: float = 0.0
 
     # ── Swap timestamps for momentum detection ──────────────
     recent_buy_times: list = field(default_factory=list)
+    recent_sell_times: list = field(default_factory=list)
+
+    # ── Dump alert state ────────────────────────────────────
+    dump_alerted: bool = False
 
     @property
     def age_seconds(self) -> float:
@@ -151,8 +162,8 @@ class SolTokenStateTracker:
         )
         self.states[token_address] = state
         logger.info(
-            f"[sol-new] {token_address[:8]}... | pool={pair_address[:8]}... | "
-            f"liq={liquidity_sol:.2f} SOL (${liquidity_usd:,.0f})"
+            f"[+] sol {token_address[:12]}.. "
+            f"liq={liquidity_sol:.1f}SOL(${liquidity_usd:,.0f})"
         )
         return state
 
@@ -176,6 +187,10 @@ class SolTokenStateTracker:
         if state is None:
             return None
         state.total_sells += 1
+        now = time.time()
+        state.recent_sell_times.append(now)
+        cutoff = now - 60
+        state.recent_sell_times = [t for t in state.recent_sell_times if t > cutoff]
         return state
 
     def record_deployer(self, deployer: str, token_address: str) -> int:

@@ -124,6 +124,14 @@ class SignalEngine:
             self._reject(token, "unsafe_bytecode", "failed safety check")
             return False
 
+        # Copycat filter — reject tokens impersonating established tokens
+        if state.is_copycat:
+            self._reject(token, "copycat", f"name={state.token_symbol}")
+            return False
+
+        # No socials warning — don't reject, but track (useful for analysis)
+        # (real new tokens rarely have socials, so this is informational only)
+
         # DexScreener honeypot proxy: if sells exist, probably not a honeypot
         # If DexScreener shows 0 sells with >5 buys, suspicious
         if state.ds_sells_m5 is not None and state.ds_buys_m5 is not None:
@@ -151,21 +159,24 @@ class SignalEngine:
 
         momentum = state.has_momentum()
 
+        hooks_tag = ""
+        if state.hooks_address and not state.hooks_address.endswith('0' * 40):
+            hooks_tag = f"  hooks={state.hooks_address[:10]}"
+
+        name_tag = ""
+        if state.token_symbol:
+            name_tag = f"  ${state.token_symbol}"
+            if not state.has_socials:
+                name_tag += " ⚠no-socials"
+
         logger.info(
-            f"{'='*60}\n"
-            f"  🎯 SIGNAL FIRED\n"
-            f"  Token:     {state.token_address}\n"
-            f"  Version:   {state.dex_version}\n"
-            f"  Age:       {age:.0f}s\n"
-            f"  Mcap:      ${mcap:,.0f}\n"
-            f"  Liquidity: ${liquidity:,.0f}\n"
-            f"  Buys:      {buys} (unique: {len(state.unique_buyers)})\n"
-            f"  Largest:   ${state.largest_buy_usd:,.0f} ({largest_buy_pct:.1f}% of liq)\n"
-            f"  Volume:    ${state.buy_volume_usd:,.0f}\n"
-            f"  Momentum:  {'YES' if momentum else 'no'}\n"
-            f"  Latency:   {time_to_signal:.1f}s (pool → signal)\n"
-            f"  Hooks:     {state.hooks_address[:10] if state.hooks_address != '0x'+'0'*40 else 'none'}\n"
-            f"{'='*60}"
+            f"\n{'═' * 55}\n"
+            f"  🎯 SIGNAL  {state.dex_version}  {state.token_address}{name_tag}\n"
+            f"  mcap=${mcap:,.0f}  liq=${liquidity:,.0f}  buys={buys}({len(state.unique_buyers)}u)  "
+            f"vol=${state.buy_volume_usd:,.0f}  top=${state.largest_buy_usd:,.0f}({largest_buy_pct:.0f}%)\n"
+            f"  mom={'YES' if momentum else 'no'}  age={age:.0f}s  "
+            f"latency={time_to_signal:.0f}s{hooks_tag}\n"
+            f"{'═' * 55}"
         )
 
         # Enqueue for Telegram
@@ -197,12 +208,12 @@ class SignalEngine:
     def record_post_mortem(self, record: dict):
         """Store a post-mortem record for a signaled token."""
         self.post_mortems.append(record)
+        outcome = record.get("outcome", "?")
+        change = record.get("price_change_pct", 0)
         logger.info(
-            f"[post-mortem] {record['token'][:10]}... "
-            f"latency={record['latency_s']:.0f}s "
-            f"mcap_at_signal=${record.get('mcap_at_signal', 0):,.0f} "
-            f"mcap_10m=${record.get('mcap_10m', 0):,.0f} "
-            f"change={record.get('price_change_pct', 0):+.1f}%"
+            f"[pm] {outcome} {record['token'][:12]}.. "
+            f"${record.get('mcap_at_signal', 0):,.0f}→${record.get('mcap_10m', 0):,.0f} "
+            f"({change:+.0f}%)"
         )
 
     def get_stats(self) -> dict:

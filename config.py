@@ -33,6 +33,14 @@ MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "5"))
 
 # ── Anti-Spam ──────────────────────────────────────────────────
 MAX_DEPLOYER_TOKENS_24H = int(os.getenv("MAX_DEPLOYER_TOKENS_24H", "2"))
+
+# ── Whale Alert ────────────────────────────────────────────────
+# Minimum swap USD value to trigger a whale alert on tracked tokens
+WHALE_ALERT_MIN_USD = float(os.getenv("WHALE_ALERT_MIN_USD", "500"))
+
+# ── Volume Spike Scanner ──────────────────────────────────────
+# Detect old tokens suddenly getting volume spikes (piggybacks on V3 global Swap sub)
+VOLUME_SPIKE_ENABLED = os.getenv("VOLUME_SPIKE_ENABLED", "true").lower() == "true"
 # ── Latency Cutoff ─────────────────────────────────────────────────
 # If signal latency (pool creation → signal) exceeds this, skip it.
 # Set to 0 to disable (allow any latency within MAX_TOKEN_AGE_SECONDS).

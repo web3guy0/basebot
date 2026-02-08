@@ -9,6 +9,7 @@ import asyncio
 import logging
 from eth_abi import decode
 
+import config
 from base.constants import (
     V4_POOL_MANAGER,
     TOPIC_V4_INITIALIZE,
@@ -24,11 +25,12 @@ logger = logging.getLogger("v4_listener")
 class V4Listener:
     """Listens to Uniswap V4 PoolManager for Initialize + Swap events."""
 
-    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn):
+    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None):
         self.w3 = w3
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
+        self.whale_queue = whale_queue
         self.pool_id_to_token: dict[str, tuple[str, bool]] = {}  # pool_id -> (token_addr, eth_is_token0)
 
     async def register_subscriptions(self):
@@ -101,13 +103,13 @@ class V4Listener:
 
         # Hooks safety check (blacklist: reject known-malicious, allow standard hooks)
         if hooks_lower in BLOCKED_HOOKS:
-            logger.info(f"[v4-skip] Pool {pool_id[:16]}... blocked hooks: {hooks_lower[:16]}...")
+            logger.debug(f"[v4-skip] {pool_id[:16]}.. hooks={hooks_lower[:16]}..")
             return
 
         has_hooks = not hooks_lower.endswith('0' * 40)
-        logger.info(
-            f"[v4-init] New pool | token={token_address[:10]}... | "
-            f"fee={fee} | tick={tick} | hooks={'none' if not has_hooks else hooks_lower[:16]}..."
+        logger.debug(
+            f"[v4-init] {token_address[:10]}.. fee={fee} tick={tick} "
+            f"hooks={'none' if not has_hooks else hooks_lower[:16]}.."
         )
 
         state = self.tracker.create(
@@ -164,3 +166,14 @@ class V4Listener:
                 await self.engine.evaluate(updated)
         else:
             self.tracker.record_sell(token_address)
+
+        # Whale alert: large swap on a tracked token
+        if self.whale_queue and usd_value >= config.WHALE_ALERT_MIN_USD:
+            self.whale_queue.put_nowait({
+                "token": token_address,
+                "chain": "base",
+                "is_buy": is_buy,
+                "usd": usd_value,
+                "sender": sender,
+                "symbol": state.token_symbol if state else "",
+            })

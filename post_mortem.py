@@ -103,6 +103,7 @@ class PostMortemTracker:
 
         record = {
             "token": token,
+            "chain": chain,
             "latency_s": entry["latency_s"],
             "mcap_at_signal": mcap_at_signal,
             "mcap_10m": mcap_now,

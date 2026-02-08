@@ -29,6 +29,7 @@ from dexscreener import DexScreenerClient, DexScreenerEnricher, SolDexScreenerEn
 from telegram_sender import TelegramSender
 from telegram_bot import SignalBot
 from post_mortem import PostMortemTracker
+from volume_scanner import VolumeScanner
 
 # Solana imports (conditional on SOL_ENABLED)
 if config.SOL_ENABLED:
@@ -39,13 +40,14 @@ if config.SOL_ENABLED:
 # ── Logging ──
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(name)-14s | %(levelname)-5s | %(message)s",
+    format="%(asctime)s  %(name)-10s  %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
 logger = logging.getLogger("main")
 logging.getLogger("web3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 
 class EthPriceOracle:
@@ -170,11 +172,23 @@ class SignalDetector:
         self.telegram = TelegramSender(self._basedbot_queue)
         # Personal Bot (Bot API) — sends rich formatted signals to you
         self._personalbot_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Whale alert queue — large swaps on tracked tokens
+        self._whale_queue: asyncio.Queue[dict] = asyncio.Queue()
+        # Pump / volume spike alert queue
+        self._pump_queue: asyncio.Queue[dict] = asyncio.Queue()
         self.signal_bot = SignalBot(
             self._personalbot_queue,
             state_tracker=self.state_tracker,
             sol_state_tracker=self.sol_state_tracker,
+            whale_queue=self._whale_queue,
+            pump_queue=self._pump_queue,
         )
+
+        # Volume spike scanner (piggybacks on V3 global swap subscription)
+        self.volume_scanner = VolumeScanner(
+            alert_queue=self._pump_queue,
+            dex_client=self._shared_dex_client,
+        ) if config.VOLUME_SPIKE_ENABLED else None
 
         self.w3 = None
         self._safety_checker = None
@@ -191,18 +205,18 @@ class SignalDetector:
             )
 
     async def start(self):
-        logger.info("=" * 60)
-        logger.info("  EARLY TOKEN SIGNAL DETECTOR")
-        logger.info(f"  Chain:      Base (8453) + {'Solana' if config.SOL_ENABLED else 'Solana DISABLED'}")
-        logger.info(f"  Mode:       {'DRY RUN' if config.DRY_RUN else 'LIVE'}")
-        logger.info(f"  Max age:    {config.MAX_TOKEN_AGE_SECONDS}s (EVM) / {config.SOL_MAX_TOKEN_AGE_SECONDS}s (SOL)")
-        logger.info(f"  Max mcap:   ${config.MAX_MCAP_USD:,.0f}")
-        logger.info(f"  Min liq:    ${config.MIN_LIQUIDITY_USD:,.0f}")
-        logger.info(f"  Min buys:   {config.MIN_BUYS}")
-        logger.info(f"  Signals/hr: {config.MAX_SIGNALS_PER_HOUR}")
-        logger.info("=" * 60)
+        mode = '\033[33mDRY RUN\033[0m' if config.DRY_RUN else '\033[31mLIVE\033[0m'
+        sol = '+ Solana' if config.SOL_ENABLED else ''
+        logger.info(
+            f"\n{'━' * 50}\n"
+            f"  SIGNAL DETECTOR  │  Base {sol}  │  {mode}\n"
+            f"  age={config.MAX_TOKEN_AGE_SECONDS}s  mcap≤${config.MAX_MCAP_USD/1000:.0f}k  "
+            f"liq≥${config.MIN_LIQUIDITY_USD/1000:.0f}k  buys≥{config.MIN_BUYS}  "
+            f"rate={config.MAX_SIGNALS_PER_HOUR}/hr\n"
+            f"{'━' * 50}"
+        )
 
-        logger.info(f"Connecting to {config.RPC_WSS[:50]}...")
+        logger.info(f"Connecting to {config.RPC_WSS[:40]}...")
 
         async with AsyncWeb3(WebSocketProvider(config.RPC_WSS)) as w3:
             self.w3 = w3
@@ -213,17 +227,17 @@ class SignalDetector:
                 return
 
             block = await w3.eth.block_number
-            logger.info(f"Connected to Base | Block: {block}")
+            logger.info(f"\u2713 Base chain_id={chain_id} block={block}")
 
             self._safety_checker = SafetyChecker(w3)
 
             # Fetch initial ETH price
             await self.eth_oracle.update()
-            logger.info(f"ETH price: ${self.eth_oracle.get_price():,.0f}")
+            logger.info(f"\u2713 ETH=${self.eth_oracle.get_price():,.0f}")
 
             # Build listeners (they share the same w3 + subscription manager)
-            self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
-            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
+            self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue)
+            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self.volume_scanner)
 
             # Register all subscriptions (V4 + V3), then run handler once
             await self._v4.register_subscriptions()
@@ -245,9 +259,16 @@ class SignalDetector:
                 asyncio.create_task(self._stats_loop(), name="stats"),
                 asyncio.create_task(self.post_mortem.start(), name="post_mortem"),
                 asyncio.create_task(self._signal_hook_loop(), name="signal_hook"),
+                asyncio.create_task(self._dump_monitor_loop(), name="dump_monitor"),
             ]
 
-            logger.info("All systems running. Waiting for new tokens...")
+            # Volume spike scanner (optional)
+            if self.volume_scanner:
+                # Give scanner reference to new-token pools so it skips them
+                self.volume_scanner._new_token_pools = self._v3._tracked_pools
+                tasks.append(asyncio.create_task(self.volume_scanner.run(), name="volume_scanner"))
+
+            logger.info("\u2713 All tasks launched. Listening...")
 
             # ── Add Solana tasks if enabled ────────────────────
             if config.SOL_ENABLED:
@@ -346,6 +367,58 @@ class SignalDetector:
             seen_signals &= active
             await asyncio.sleep(2)
 
+    async def _dump_monitor_loop(self):
+        """Monitor signaled tokens for rapid sell-offs. Alert once per token."""
+        SELL_THRESHOLD = 5   # sells in last 60s to trigger alert
+        while True:
+            try:
+                # EVM
+                for addr, state in list(self.state_tracker.states.items()):
+                    if not state.signaled or state.dump_alerted:
+                        continue
+                    now = time.time()
+                    sells_60s = len([t for t in state.recent_sell_times if now - t <= 60])
+                    if sells_60s >= SELL_THRESHOLD:
+                        state.dump_alerted = True
+                        logger.info(
+                            f"[dump] {addr[:12]}.. sells_60s={sells_60s} "
+                            f"S/B={state.total_sells}/{state.total_buys}"
+                        )
+                        await self.signal_bot.send_dump_alert(
+                            token_address=addr,
+                            chain="base",
+                            sells_60s=sells_60s,
+                            total_sells=state.total_sells,
+                            total_buys=state.best_buys,
+                            mcap=state.best_mcap,
+                            liq=state.best_liquidity,
+                        )
+                # Solana
+                if self.sol_state_tracker:
+                    for addr, state in list(self.sol_state_tracker.states.items()):
+                        if not state.signaled or state.dump_alerted:
+                            continue
+                        now = time.time()
+                        sells_60s = len([t for t in state.recent_sell_times if now - t <= 60])
+                        if sells_60s >= SELL_THRESHOLD:
+                            state.dump_alerted = True
+                            logger.info(
+                                f"[dump] sol {addr[:12]}.. sells_60s={sells_60s} "
+                                f"S/B={state.total_sells}/{state.total_buys}"
+                            )
+                            await self.signal_bot.send_dump_alert(
+                                token_address=addr,
+                                chain="solana",
+                                sells_60s=sells_60s,
+                                total_sells=state.total_sells,
+                                total_buys=state.best_buys,
+                                mcap=state.best_mcap,
+                                liq=state.best_liquidity,
+                            )
+            except Exception as e:
+                logger.error(f"Dump monitor error: {e}")
+            await asyncio.sleep(5)
+
     async def _eviction_loop(self):
         while True:
             self.state_tracker.evict_stale()
@@ -412,35 +485,35 @@ class SignalDetector:
         while True:
             await asyncio.sleep(300)
             stats = self.engine.get_stats()
-            active_evm = self.state_tracker.active_count
-            active_sol = (
+            evm = self.state_tracker.active_count
+            sol = (
                 self.sol_state_tracker.active_count
                 if self.sol_state_tracker
                 else 0
             )
-            latency_str = ""
+            lat = ""
             if "avg_latency_s" in stats:
-                latency_str = (
-                    f" latency_avg={stats['avg_latency_s']}s"
-                    f" min={stats['min_latency_s']}s"
-                    f" max={stats['max_latency_s']}s"
-                )
+                lat = f" lat={stats['avg_latency_s']}/{stats['min_latency_s']}-{stats['max_latency_s']}s"
             logger.info(
-                f"[stats] evm={active_evm} sol={active_sol} "
-                f"evaluated={stats['evaluated']} "
-                f"signaled={stats['signaled']} rejected={stats['rejected']} "
-                f"signals_this_hr={stats['signals_this_hour']}{latency_str}"
+                f"[stats] tokens={evm}+{sol} "
+                f"eval={stats['evaluated']} sig={stats['signaled']} "
+                f"rej={stats['rejected']} hr={stats['signals_this_hour']}{lat}"
             )
             if stats.get("latency_distribution"):
-                logger.info(f"[stats] latency buckets: {stats['latency_distribution']}")
+                buckets = " ".join(f"{k}:{v}" for k, v in stats["latency_distribution"].items())
+                logger.info(f"[stats] latency: {buckets}")
             if stats.get("post_mortem_count"):
                 logger.info(
-                    f"[stats] post-mortems: {stats['post_mortem_count']} "
-                    f"TP_hit={stats['tp_hit_rate']} rugs={stats['rug_rate']}"
+                    f"[stats] pm={stats['post_mortem_count']} "
+                    f"tp={stats['tp_hit_rate']} rug={stats['rug_rate']}"
                 )
             if stats["reject_reasons"]:
                 top = sorted(stats["reject_reasons"].items(), key=lambda x: -x[1])[:5]
-                logger.info(f"[stats] top rejections: {dict(top)}")
+                logger.info(f"[stats] rejects: {dict(top)}")
+            if self.volume_scanner:
+                pools = len(self.volume_scanner._swaps)
+                spikes = self.volume_scanner._total_spikes
+                logger.info(f"[stats] scanner: pools={pools} spikes={spikes}")
 
 
 async def main():

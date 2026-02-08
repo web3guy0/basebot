@@ -10,6 +10,7 @@ import asyncio
 import logging
 from eth_abi import decode
 
+import config
 from base.constants import (
     V3_FACTORY,
     TOPIC_V3_POOL_CREATED,
@@ -27,11 +28,13 @@ ALLOWED_FEE_TIERS = {3000, 10000}
 class V3Listener:
     """Listens to V3 Factory for PoolCreated, then Swaps on new pools."""
 
-    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn):
+    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, volume_scanner=None):
         self.w3 = w3
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
+        self.whale_queue = whale_queue
+        self.volume_scanner = volume_scanner
         self.pool_to_token: dict[str, tuple[str, bool]] = {}  # pool_addr -> (token_addr, eth_is_token0)
         self._tracked_pools: set[str] = set()
 
@@ -55,6 +58,9 @@ class V3Listener:
                     pool_addr = pool_addr.lower()
                 else:
                     pool_addr = str(pool_addr).lower()
+                # Record every swap for volume spike scanner (before filter)
+                if self.volume_scanner:
+                    self.volume_scanner.record_swap(pool_addr)
                 if pool_addr in self._tracked_pools:
                     await self._handle_swap(log, pool_addr)
             except Exception as e:
@@ -109,9 +115,8 @@ class V3Listener:
             token_address = token0
             eth_is_token0 = False
 
-        logger.info(
-            f"[v3-pool] New pool | token={token_address[:10]}... | "
-            f"pool={pool_addr[:10]}... | fee={fee}"
+        logger.debug(
+            f"[v3-pool] {token_address[:10]}.. pool={pool_addr[:10]}.. fee={fee}"
         )
 
         state = self.tracker.create(
@@ -181,3 +186,14 @@ class V3Listener:
                 await self.engine.evaluate(updated)
         else:
             self.tracker.record_sell(token_address)
+
+        # Whale alert: large swap on a tracked token
+        if self.whale_queue and usd_value >= config.WHALE_ALERT_MIN_USD:
+            self.whale_queue.put_nowait({
+                "token": token_address,
+                "chain": "base",
+                "is_buy": is_buy,
+                "usd": usd_value,
+                "sender": sender,
+                "symbol": state.token_symbol if state else "",
+            })

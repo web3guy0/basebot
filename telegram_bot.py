@@ -29,8 +29,10 @@ class SignalBot:
     Consumes from the shared signal_queue (same as TelegramSender).
     """
 
-    def __init__(self, signal_queue: asyncio.Queue, state_tracker=None, sol_state_tracker=None):
+    def __init__(self, signal_queue: asyncio.Queue, state_tracker=None, sol_state_tracker=None, whale_queue=None, pump_queue=None):
         self.signal_queue = signal_queue
+        self.whale_queue = whale_queue
+        self.pump_queue = pump_queue
         self.tracker = state_tracker
         self.sol_tracker = sol_state_tracker
         self._session: Optional[aiohttp.ClientSession] = None
@@ -79,8 +81,13 @@ class SignalBot:
             f"Min liq: ${config.MIN_LIQUIDITY_USD:,.0f}"
         )
 
-        # Consume signals
-        await self._send_loop()
+        # Consume signals + whale alerts + pump alerts
+        tasks = [asyncio.create_task(self._send_loop())]
+        if self.whale_queue:
+            tasks.append(asyncio.create_task(self._whale_loop()))
+        if self.pump_queue:
+            tasks.append(asyncio.create_task(self._pump_loop()))
+        await asyncio.gather(*tasks)
 
     async def _send_loop(self):
         """Consume from signal queue and send formatted alerts."""
@@ -96,7 +103,7 @@ class SignalBot:
                 await asyncio.sleep(1)
 
     async def _send_signal(self, contract_address: str):
-        """Build and send a rich signal message."""
+        """Build and send a rich signal message with inline keyboard buttons."""
         # Look up state from tracker for extra context
         state = None
         chain = "base"
@@ -107,6 +114,28 @@ class SignalBot:
             state = self.sol_tracker.get(contract_address)
             if state:
                 chain = "solana"
+
+        # Chain-specific links
+        if chain == "solana":
+            explorer_link = f"https://solscan.io/token/{contract_address}"
+            ds_link = f"https://dexscreener.com/solana/{contract_address}"
+            chain_emoji = "🟣"
+            chain_name = "Solana"
+        else:
+            explorer_link = f"https://basescan.org/token/{contract_address}"
+            ds_link = f"https://dexscreener.com/base/{contract_address}"
+            chain_emoji = "🔵"
+            chain_name = "Base"
+
+        # Inline keyboard: one-tap DexScreener, Explorer, copy-ready CA
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 DexScreener", "url": ds_link},
+                    {"text": "🔍 Explorer", "url": explorer_link},
+                ],
+            ]
+        }
 
         if state:
             age = state.age_seconds
@@ -121,58 +150,113 @@ class SignalBot:
             momentum = state.has_momentum()
             dex_ver = state.dex_version
             latency = time.time() - state.first_seen
-
-            # Chain-specific explorer links
-            if chain == "solana":
-                explorer_link = f"https://solscan.io/token/{contract_address}"
-                ds_link = f"https://dexscreener.com/solana/{contract_address}"
-                chain_emoji = "🟣"
-                chain_name = "Solana"
-            else:
-                explorer_link = f"https://basescan.org/token/{contract_address}"
-                ds_link = f"https://dexscreener.com/base/{contract_address}"
-                chain_emoji = "🔵"
-                chain_name = "Base"
+            name_tag = f" ${state.token_symbol}" if state.token_symbol else ""
+            social_tag = "" if state.has_socials else " ⚠️no-socials"
 
             message = (
-                f"🎯 <b>SIGNAL DETECTED</b> {chain_emoji} {chain_name}\n"
+                f"🎯 <b>SIGNAL</b> {chain_emoji} {chain_name}{name_tag}{social_tag}\n"
                 f"{'━' * 28}\n\n"
-                f"📋 <b>CA:</b>\n<code>{contract_address}</code>\n\n"
-                f"📊 <b>Metrics</b>\n"
+                f"<code>{contract_address}</code>\n\n"
                 f"├ Mcap: <b>${mcap:,.0f}</b>\n"
-                f"├ Liquidity: <b>${liq:,.0f}</b>\n"
-                f"├ Buys: <b>{buys}</b> (unique: {unique}) | Sells: {sells}\n"
-                f"├ Volume: ${volume:,.0f}\n"
-                f"├ Largest buy: ${largest:,.0f} ({largest_pct:.0f}% of liq)\n"
-                f"├ Momentum: {'✅ YES' if momentum else '❌ no'}\n"
-                f"├ Age: {age:.0f}s | Latency: {latency:.0f}s\n"
-                f"└ DEX: {dex_ver}\n\n"
-                f"🔗 <a href=\"{ds_link}\">DexScreener</a> · "
-                f"<a href=\"{explorer_link}\">Explorer</a>"
+                f"├ Liq: <b>${liq:,.0f}</b>\n"
+                f"├ Buys: <b>{buys}</b> ({unique} unique) · Sells: {sells}\n"
+                f"├ Vol: ${volume:,.0f}\n"
+                f"├ Top buy: ${largest:,.0f} ({largest_pct:.0f}%)\n"
+                f"├ Momentum: {'✅' if momentum else '❌'}\n"
+                f"└ {dex_ver} · {age:.0f}s · latency {latency:.0f}s"
             )
         else:
             # Minimal message if state was already evicted
             message = (
-                f"🎯 <b>SIGNAL DETECTED</b>\n\n"
-                f"<code>{contract_address}</code>\n\n"
-                f"<a href=\"https://dexscreener.com/base/{contract_address}\">DexScreener</a>"
+                f"🎯 <b>SIGNAL</b> {chain_emoji} {chain_name}\n\n"
+                f"<code>{contract_address}</code>"
             )
 
-        await self._send_message(message)
+        await self._send_message(message, reply_markup=keyboard)
         logger.info(f"[bot] Signal sent to chat {self._chat_id}: {contract_address[:16]}...")
 
-    async def _send_message(self, text: str, disable_preview: bool = True):
+    async def _whale_loop(self):
+        """Consume whale alert events and send notifications."""
+        # Debounce: max 1 whale alert per token per 30s
+        _last_alert: dict[str, float] = {}
+        while True:
+            try:
+                event = await self.whale_queue.get()
+                token = event["token"]
+                now = time.time()
+                # Debounce
+                if token in _last_alert and now - _last_alert[token] < 30:
+                    self.whale_queue.task_done()
+                    continue
+                _last_alert[token] = now
+                # Prune old entries
+                _last_alert = {k: v for k, v in _last_alert.items() if now - v < 60}
+                await self._send_whale_alert(event)
+                self.whale_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Whale loop error: {e}")
+                await asyncio.sleep(1)
+
+    async def _send_whale_alert(self, event: dict):
+        """Send a whale buy/sell alert."""
+        token = event["token"]
+        chain = event.get("chain", "base")
+        is_buy = event["is_buy"]
+        usd = event["usd"]
+        sender = event.get("sender", "?")
+        symbol = event.get("symbol", "")
+
+        emoji = "🐋💚" if is_buy else "🐋🔴"
+        action = "BUY" if is_buy else "SELL"
+        name = f" ${symbol}" if symbol else ""
+
+        if chain == "solana":
+            ds_link = f"https://dexscreener.com/solana/{token}"
+            explorer_link = f"https://solscan.io/token/{token}"
+        else:
+            ds_link = f"https://dexscreener.com/base/{token}"
+            explorer_link = f"https://basescan.org/token/{token}"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 DexScreener", "url": ds_link},
+                    {"text": "🔍 Explorer", "url": explorer_link},
+                ],
+            ]
+        }
+
+        message = (
+            f"{emoji} <b>WHALE {action}</b>{name}\n"
+            f"{'━' * 28}\n\n"
+            f"<code>{token}</code>\n\n"
+            f"├ Amount: <b>${usd:,.0f}</b>\n"
+            f"└ Wallet: {sender[:8]}..{sender[-4:]}"
+        )
+        await self._send_message(message, reply_markup=keyboard)
+
+    async def _send_message(
+        self,
+        text: str,
+        disable_preview: bool = True,
+        reply_markup: dict | None = None,
+    ):
         """Send a message via Telegram Bot API."""
         await self._ensure_session()
         try:
+            payload: dict = {
+                "chat_id": self._chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_preview,
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
             async with self._session.post(
                 f"{self._api_base}/sendMessage",
-                json={
-                    "chat_id": self._chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": disable_preview,
-                },
+                json=payload,
             ) as resp:
                 if resp.status != 200:
                     data = await resp.json()
@@ -186,6 +270,7 @@ class SignalBot:
             return
 
         token = record["token"]
+        chain = record.get("chain", "base")
         outcome = record.get("outcome", "UNKNOWN")
         change = record.get("price_change_pct", 0)
         mcap_signal = record.get("mcap_at_signal", 0)
@@ -198,6 +283,17 @@ class SignalBot:
         }
         emoji = emoji_map.get(outcome, "❓")
 
+        if chain == "solana":
+            ds_link = f"https://dexscreener.com/solana/{token}"
+        else:
+            ds_link = f"https://dexscreener.com/base/{token}"
+
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📊 DexScreener", "url": ds_link}],
+            ]
+        }
+
         message = (
             f"{emoji} <b>POST-MORTEM: {outcome}</b>\n\n"
             f"<code>{token[:20]}...</code>\n"
@@ -206,7 +302,130 @@ class SignalBot:
             f"├ Change: <b>{change:+.1f}%</b>\n"
             f"└ Latency: {latency:.0f}s"
         )
-        await self._send_message(message)
+        await self._send_message(message, reply_markup=keyboard)
+
+    async def send_dump_alert(
+        self,
+        token_address: str,
+        chain: str,
+        sells_60s: int,
+        total_sells: int,
+        total_buys: int,
+        mcap: float,
+        liq: float,
+    ):
+        """Send urgent dump/mass-sell alert for a signaled token."""
+        if not self._bot_token or not self._chat_id:
+            return
+
+        if chain == "solana":
+            ds_link = f"https://dexscreener.com/solana/{token_address}"
+            explorer_link = f"https://solscan.io/token/{token_address}"
+            chain_emoji = "🟣"
+        else:
+            ds_link = f"https://dexscreener.com/base/{token_address}"
+            explorer_link = f"https://basescan.org/token/{token_address}"
+            chain_emoji = "🔵"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 DexScreener", "url": ds_link},
+                    {"text": "🔍 Explorer", "url": explorer_link},
+                ],
+            ]
+        }
+
+        sell_buy_ratio = f"{total_sells}/{total_buys}"
+
+        message = (
+            f"🚨 <b>DUMP ALERT</b> {chain_emoji}\n"
+            f"{'━' * 28}\n\n"
+            f"<code>{token_address}</code>\n\n"
+            f"├ Sells in 60s: <b>{sells_60s}</b>\n"
+            f"├ Total S/B: <b>{sell_buy_ratio}</b>\n"
+            f"├ Mcap: ${mcap:,.0f}\n"
+            f"└ Liq: ${liq:,.0f}"
+        )
+        await self._send_message(message, reply_markup=keyboard)
+
+    async def _pump_loop(self):
+        """Consume volume spike alerts and send formatted notifications."""
+        while True:
+            try:
+                alert = await self.pump_queue.get()
+                await self._send_pump_alert(alert)
+                self.pump_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Pump loop error: {e}")
+                await asyncio.sleep(1)
+
+    async def _send_pump_alert(self, alert: dict):
+        """Send a volume spike / pump detection alert."""
+        token = alert.get("token", "?")
+        symbol = alert.get("symbol", "")
+        name = alert.get("name", "")
+        mcap = alert.get("mcap", 0)
+        liq = alert.get("liq", 0)
+        volume_h1 = alert.get("volume_h1", 0)
+        price_change_m5 = alert.get("price_change_m5", 0)
+        price_change_h1 = alert.get("price_change_h1", 0)
+        swaps = alert.get("swaps_2m", 0)
+        has_socials = alert.get("has_socials", False)
+        age_hours = alert.get("age_hours", 0)
+        chain = alert.get("chain", "base")
+
+        # Age formatting
+        if age_hours < 1:
+            age_str = f"{age_hours * 60:.0f}m"
+        elif age_hours < 24:
+            age_str = f"{age_hours:.0f}h"
+        else:
+            age_str = f"{age_hours / 24:.0f}d"
+
+        # Price direction emoji
+        if price_change_m5 > 10:
+            trend = "📈🔥"
+        elif price_change_m5 > 0:
+            trend = "📈"
+        elif price_change_m5 < -10:
+            trend = "📉"
+        else:
+            trend = "➡️"
+
+        name_tag = f" ${symbol}" if symbol else ""
+        social_tag = " ✅" if has_socials else " ⚠️no-socials"
+
+        if chain == "solana":
+            ds_link = f"https://dexscreener.com/solana/{token}"
+            explorer_link = f"https://solscan.io/token/{token}"
+        else:
+            ds_link = f"https://dexscreener.com/base/{token}"
+            explorer_link = f"https://basescan.org/token/{token}"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 DexScreener", "url": ds_link},
+                    {"text": "🔍 Explorer", "url": explorer_link},
+                ],
+            ]
+        }
+
+        message = (
+            f"{trend} <b>PUMP DETECTED</b>{name_tag}{social_tag}\n"
+            f"{'━' * 28}\n\n"
+            f"<code>{token}</code>\n\n"
+            f"├ Mcap: <b>${mcap:,.0f}</b>\n"
+            f"├ Liq: ${liq:,.0f}\n"
+            f"├ Vol 1h: ${volume_h1:,.0f}\n"
+            f"├ Δ5m: <b>{price_change_m5:+.1f}%</b> · Δ1h: {price_change_h1:+.1f}%\n"
+            f"├ Swaps/2m: <b>{swaps}</b>\n"
+            f"└ Age: {age_str}"
+        )
+        await self._send_message(message, reply_markup=keyboard)
 
     async def stop(self):
         """Send offline message and close session."""
