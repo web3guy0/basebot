@@ -24,11 +24,27 @@ logger = logging.getLogger("scanner")
 
 # ── Tunable thresholds ───────────────────────────────────────────
 SPIKE_WINDOW_S = 120         # Rolling window (seconds) for counting swaps
-MIN_SWAPS_FOR_SPIKE = 10     # Min swaps in window to trigger
-COOLDOWN_S = 600             # 10 min between alerts per pool
+MIN_SWAPS_FOR_SPIKE = 25     # Min swaps in window to trigger (high bar = real spikes only)
+COOLDOWN_S = 1800            # 30 min between alerts per pool
 MAX_TRACKED_POOLS = 10_000   # Memory cap: drop least-active pools beyond this
-PAIR_MIN_AGE_MS = 300_000    # 5 min — skip very new pairs (already in new-token pipeline)
-PAIR_MIN_LIQ_USD = 1_000     # Skip dust pools
+PAIR_MIN_AGE_MS = 3_600_000  # 1 hour — truly established tokens only
+PAIR_MIN_LIQ_USD = 5_000     # Skip dust pools
+PAIR_MAX_MCAP_USD = 5_000_000  # Skip large-caps (WETH/cbBTC/ZORA etc: not "pumps")
+PAIR_MIN_MCAP_USD = 1_000    # Skip dead tokens
+
+# Known base-layer tokens whose V3 pools always have high swap frequency.
+# These are NOT pumps — they're just busy. Skip them entirely from recording.
+_SKIP_TOKENS = {
+    "0x4200000000000000000000000000000000000006",  # WETH
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
+    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",  # cbBTC
+    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH
+    "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",  # wstETH
+    "0x940181a94a35a4569e4529a3cdfb74e38fd98631",  # AERO
+    "0x1111111111166b7fe7bd91427724b487980afc69",  # ZORA (huge mcap)
+}
 
 
 class VolumeScanner:
@@ -110,7 +126,7 @@ class VolumeScanner:
             # Spike detected
             self._cooldowns[pool] = now
             self._total_spikes += 1
-            logger.info(f"[spike] {pool[:12]}.. swaps={count}/{SPIKE_WINDOW_S}s")
+            logger.debug(f"[spike] {pool[:12]}.. swaps={count}/{SPIKE_WINDOW_S}s")
             asyncio.create_task(self._enrich_and_alert(pool, count))
 
     async def _enrich_and_alert(self, pool_addr: str, swap_count: int):
@@ -131,12 +147,28 @@ class VolumeScanner:
             price_change_h1 = (pair_data.get("priceChange") or {}).get("h1", 0)
             pair_created = pair_data.get("pairCreatedAt", 0)
 
+            # Skip known base-layer tokens by address
+            if token_addr.lower() in _SKIP_TOKENS:
+                return
+
             # Skip very new pairs — already handled by the new-token pipeline
             if pair_created and time.time() * 1000 - pair_created < PAIR_MIN_AGE_MS:
                 return
 
             # Skip dust / dead pools
             if liq < PAIR_MIN_LIQ_USD:
+                return
+
+            # Skip large-cap tokens (not a "pump", just normal volume)
+            if mcap > PAIR_MAX_MCAP_USD:
+                return
+
+            # Skip dead mcap
+            if mcap < PAIR_MIN_MCAP_USD:
+                return
+
+            # Only alert if price is actually moving up (real pump, not just churn)
+            if price_change_m5 <= 0 and price_change_h1 <= 0:
                 return
 
             info = pair_data.get("info", {})
