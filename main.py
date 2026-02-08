@@ -27,6 +27,7 @@ from base.safety import SafetyChecker, run_safety_check
 from signal_engine import SignalEngine
 from dexscreener import DexScreenerClient, DexScreenerEnricher, SolDexScreenerEnricher
 from telegram_sender import TelegramSender
+from telegram_bot import SignalBot
 from post_mortem import PostMortemTracker
 
 # Solana imports (conditional on SOL_ENABLED)
@@ -160,8 +161,21 @@ class SignalDetector:
         self.post_mortem = PostMortemTracker(
             dex_client=self._shared_dex_client,
             signal_engine=self.engine,
+            on_complete=self._on_post_mortem,
         )
-        self.telegram = TelegramSender(self.engine.signal_queue)
+
+        # ── Telegram outputs (fanout: engine → both consumers) ──
+        # Based Bot (Telethon userbot) — sends CA to Based Bot chat
+        self._basedbot_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.telegram = TelegramSender(self._basedbot_queue)
+        # Personal Bot (Bot API) — sends rich formatted signals to you
+        self._personalbot_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.signal_bot = SignalBot(
+            self._personalbot_queue,
+            state_tracker=self.state_tracker,
+            sol_state_tracker=self.sol_state_tracker,
+        )
+
         self.w3 = None
         self._safety_checker = None
 
@@ -222,7 +236,9 @@ class SignalDetector:
                     name="subscription_handler",
                 ),
                 asyncio.create_task(self.dex_enricher.start(), name="dex_enricher"),
+                asyncio.create_task(self._signal_fanout(), name="signal_fanout"),
                 asyncio.create_task(self.telegram.start(), name="telegram"),
+                asyncio.create_task(self.signal_bot.start(), name="signal_bot"),
                 asyncio.create_task(self.eth_oracle.run_refresh_loop(), name="eth_price"),
                 asyncio.create_task(self._eviction_loop(), name="eviction"),
                 asyncio.create_task(self._safety_loop(), name="safety"),
@@ -275,6 +291,26 @@ class SignalDetector:
                     logger.error(f"Task {task.get_name()} crashed: {task.exception()}")
             for task in pending:
                 task.cancel()
+
+    async def _on_post_mortem(self, record: dict):
+        """Forward post-mortem results to personal bot."""
+        if self.signal_bot:
+            await self.signal_bot.send_post_mortem(record)
+
+    async def _signal_fanout(self):
+        """Consume from engine's signal_queue and duplicate to all output queues."""
+        while True:
+            try:
+                contract_address = await self.engine.signal_queue.get()
+                # Fan out to both consumers
+                await self._basedbot_queue.put(contract_address)
+                await self._personalbot_queue.put(contract_address)
+                self.engine.signal_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Signal fanout error: {e}")
+                await asyncio.sleep(0.1)
 
     async def _signal_hook_loop(self):
         """Watch for new signals and schedule post-mortem follow-ups."""
@@ -423,6 +459,8 @@ async def _shutdown(detector: SignalDetector):
         await detector.post_mortem.stop()
     if detector.telegram:
         await detector.telegram.stop()
+    if detector.signal_bot:
+        await detector.signal_bot.stop()
     # Solana cleanup
     if detector.sol_enricher:
         await detector.sol_enricher.stop()

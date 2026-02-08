@@ -12,11 +12,16 @@ RPC_WSS = os.getenv("RPC_WSS", "wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY")
 RPC_HTTP = os.getenv("RPC_HTTP", "https://mainnet.base.org")
 CHAIN_ID = 8453  # Base Mainnet
 
-# ── Telegram ────────────────────────────────────────────────────
+# ── Telegram (Based Bot — Telethon userbot) ─────────────────
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "signal_session")
-BASED_BOT_USERNAME = os.getenv("BASED_BOT_USERNAME", "BasedBot")
+BASED_BOT_USERNAME = os.getenv("BASED_BOT_USERNAME", "based_eth_bot")
+
+# ── Personal Telegram Bot (Bot API — recommended) ──────────
+# Create via @BotFather, get your chat_id from @userinfobot
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_CHAT_ID = os.getenv("BOT_CHAT_ID", "")
 
 # ── Signal Thresholds ──────────────────────────────────────────
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "180"))

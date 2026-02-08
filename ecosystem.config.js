@@ -1,0 +1,25 @@
+module.exports = {
+  apps: [
+    {
+      name: "signal-detector",
+      script: "python3",
+      args: "main.py",
+      cwd: "/root/basebot",           // ← change to your VPS path
+      interpreter: "none",             // we specify python3 as the script directly
+      autorestart: true,
+      watch: false,
+      max_restarts: 50,
+      restart_delay: 5000,             // 5s between restarts
+      max_memory_restart: "500M",
+      env: {
+        PYTHONUNBUFFERED: "1",         // force unbuffered output for real-time logs
+      },
+      // Log configuration
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "/root/basebot/logs/error.log",
+      out_file: "/root/basebot/logs/out.log",
+      merge_logs: true,
+      log_type: "json",
+    },
+  ],
+};

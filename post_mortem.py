@@ -18,12 +18,13 @@ class PostMortemTracker:
     Uses DexScreener to check mcap after the follow-up window.
     """
 
-    def __init__(self, dex_client, signal_engine, follow_up_seconds: int = 600):
+    def __init__(self, dex_client, signal_engine, follow_up_seconds: int = 600, on_complete=None):
         self.dex_client = dex_client
         self.engine = signal_engine
         self.follow_up_seconds = follow_up_seconds
         self._pending: list[dict] = []  # tokens awaiting follow-up
         self._running = False
+        self._on_complete = on_complete  # async callback(record) for notifications
 
     def schedule(self, token_address: str, mcap_at_signal: float, latency: float, chain: str = "base"):
         """Schedule a post-mortem check for a token that just signaled."""
@@ -126,3 +127,10 @@ class PostMortemTracker:
 
         # Store in signal engine
         self.engine.record_post_mortem(record)
+
+        # Fire notification callback (e.g., personal bot)
+        if self._on_complete:
+            try:
+                await self._on_complete(record)
+            except Exception as e:
+                logger.debug(f"Post-mortem callback error: {e}")

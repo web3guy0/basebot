@@ -188,7 +188,6 @@ Signals will be sent as raw contract addresses to Based Bot on Telegram.
 | `MIN_BUYS` | `2` | Min buy transactions |
 | `MIN_LARGEST_BUY_PCT` | `10` | Min largest buy as % of liquidity |
 | `MAX_SIGNALS_PER_HOUR` | `5` | Signal rate limit |
-| `IGNORE_LIQUIDITY_BELOW_USD` | `2000` | Skip tokens below this liquidity |
 | `MAX_DEPLOYER_TOKENS_24H` | `2` | Max tokens per deployer in 24h |
 | `DRY_RUN` | `true` | Log-only mode (no Telegram sends) |
 | `LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG/INFO/WARNING) |
