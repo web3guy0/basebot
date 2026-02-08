@@ -9,14 +9,14 @@ import asyncio
 import logging
 from eth_abi import decode
 
-from constants import (
+from base.constants import (
     V4_POOL_MANAGER,
     TOPIC_V4_INITIALIZE,
     TOPIC_V4_SWAP,
     ETH_ADDRESSES,
     SAFE_HOOKS,
 )
-from price_utils import estimate_mcap, estimate_liquidity_usd
+from base.price_utils import estimate_mcap, estimate_liquidity_usd
 
 logger = logging.getLogger("v4_listener")
 
@@ -29,7 +29,7 @@ class V4Listener:
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
-        self.pool_id_to_token: dict[str, str] = {}
+        self.pool_id_to_token: dict[str, tuple[str, bool]] = {}  # pool_id -> (token_addr, eth_is_token0)
 
     async def register_subscriptions(self):
         """Register V4 PoolManager subscriptions (Initialize + Swap).
@@ -51,14 +51,14 @@ class V4Listener:
 
         await self.w3.eth.subscribe(
             "logs",
-            {"address": V4_POOL_MANAGER, "topics": [[TOPIC_V4_INITIALIZE]]},
+            {"address": V4_POOL_MANAGER, "topics": [TOPIC_V4_INITIALIZE]},
             handler=on_initialize,
             label="v4_initialize",
         )
 
         await self.w3.eth.subscribe(
             "logs",
-            {"address": V4_POOL_MANAGER, "topics": [[TOPIC_V4_SWAP]]},
+            {"address": V4_POOL_MANAGER, "topics": [TOPIC_V4_SWAP]},
             handler=on_swap,
             label="v4_swap",
         )
@@ -116,7 +116,7 @@ class V4Listener:
             hooks_address=hooks_lower,
             sqrt_price_x96=sqrt_price_x96,
         )
-        self.pool_id_to_token[pool_id] = token_address.lower()
+        self.pool_id_to_token[pool_id] = (token_address.lower(), eth_is_token0)
 
         if sqrt_price_x96 > 0:
             estimate_mcap(state, sqrt_price_x96, eth_is_token0, self.eth_price_fn())
@@ -127,9 +127,10 @@ class V4Listener:
         data = bytes(log["data"])
 
         pool_id = topics[1].hex() if hasattr(topics[1], "hex") else str(topics[1])
-        token_address = self.pool_id_to_token.get(pool_id)
-        if token_address is None:
+        entry = self.pool_id_to_token.get(pool_id)
+        if entry is None:
             return
+        token_address, eth_is_token0 = entry
 
         state = self.tracker.get(token_address)
         if state is None or state.signaled:
@@ -142,13 +143,15 @@ class V4Listener:
         state.sqrt_price_x96 = sqrt_price_x96
         eth_price = self.eth_price_fn()
 
-        # Smaller absolute value ≈ ETH amount (ETH has fewer raw units than meme tokens)
-        abs0, abs1 = abs(amount0), abs(amount1)
-        eth_value = min(abs0, abs1) / 1e18
-        usd_value = eth_value * eth_price
+        # Precise ETH value using known token ordering
+        if eth_is_token0:
+            eth_value = abs(amount0) / 1e18
+            is_buy = amount0 > 0  # ETH entering pool → user buying meme token
+        else:
+            eth_value = abs(amount1) / 1e18
+            is_buy = amount1 > 0  # ETH entering pool → user buying meme token
 
-        # Positive amount = tokens entering pool; Buy = ETH enters pool
-        is_buy = (amount0 > 0 and amount1 < 0) or (amount1 > 0 and amount0 < 0)
+        usd_value = eth_value * eth_price
 
         if is_buy:
             updated = self.tracker.record_buy(token_address, sender, usd_value)

@@ -5,7 +5,7 @@ Non-blocking: runs as a background task per token, results stored in TokenState.
 import asyncio
 import logging
 
-from constants import DANGEROUS_SELECTORS, CONTEXT_SELECTORS, PROXY_PATTERNS
+from base.constants import DANGEROUS_SELECTORS, CONTEXT_SELECTORS, PROXY_PATTERNS
 
 logger = logging.getLogger("safety")
 

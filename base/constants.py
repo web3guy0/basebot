@@ -49,14 +49,14 @@ ETH_ADDRESSES = {
 # ── V3 Events ───────────────────────────────────────────────────
 # PoolCreated(address indexed token0, address indexed token1,
 #             uint24 indexed fee, int24 tickSpacing, address pool)
-TOPIC_V3_POOL_CREATED = Web3.keccak(
+TOPIC_V3_POOL_CREATED = "0x" + Web3.keccak(
     text="PoolCreated(address,address,uint24,int24,address)"
 ).hex()
 
 # Swap(address indexed sender, address indexed recipient,
 #      int256 amount0, int256 amount1, uint160 sqrtPriceX96,
 #      uint128 liquidity, int24 tick)
-TOPIC_V3_SWAP = Web3.keccak(
+TOPIC_V3_SWAP = "0x" + Web3.keccak(
     text="Swap(address,address,int256,int256,uint160,uint128,int24)"
 ).hex()
 
@@ -64,21 +64,21 @@ TOPIC_V3_SWAP = Web3.keccak(
 # Initialize(bytes32 indexed id, address indexed currency0,
 #            address indexed currency1, uint24 fee, int24 tickSpacing,
 #            address hooks, uint160 sqrtPriceX96, int24 tick)
-TOPIC_V4_INITIALIZE = Web3.keccak(
+TOPIC_V4_INITIALIZE = "0x" + Web3.keccak(
     text="Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)"
 ).hex()
 
 # Swap(bytes32 indexed id, address indexed sender,
 #      int128 amount0, int128 amount1, uint160 sqrtPriceX96,
 #      uint128 liquidity, int24 tick, uint24 fee)
-TOPIC_V4_SWAP = Web3.keccak(
+TOPIC_V4_SWAP = "0x" + Web3.keccak(
     text="Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"
 ).hex()
 
 # ModifyLiquidity(bytes32 indexed id, address indexed sender,
 #                 int24 tickLower, int24 tickUpper,
 #                 int256 liquidityDelta, bytes32 salt)
-TOPIC_V4_MODIFY_LIQUIDITY = Web3.keccak(
+TOPIC_V4_MODIFY_LIQUIDITY = "0x" + Web3.keccak(
     text="ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"
 ).hex()
 

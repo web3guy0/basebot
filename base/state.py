@@ -98,7 +98,7 @@ class TokenStateTracker:
     def __init__(self, max_age: int = 300):
         self.states: dict[str, TokenState] = {}
         self.max_age = max_age  # eviction TTL (seconds), slightly > signal window
-        self._deployer_history: dict[str, list[float]] = {}  # deployer -> [timestamps]
+        self._deployer_history: dict[str, dict[str, float]] = {}  # deployer -> {token -> timestamp}
 
     def get(self, token_address: str) -> TokenState | None:
         """Get token state by address. Returns None if not found or expired (TTL enforced)."""
@@ -169,18 +169,21 @@ class TokenStateTracker:
         state.total_sells += 1
         return state
 
-    def record_deployer(self, deployer: str) -> int:
-        """Track deployer activity. Returns number of tokens in last 24h."""
+    def record_deployer(self, deployer: str, token_address: str) -> int:
+        """Track deployer activity. Idempotent per (deployer, token) pair.
+        Returns number of unique tokens by this deployer in last 24h."""
         addr = deployer.lower()
         now = time.time()
         if addr not in self._deployer_history:
-            self._deployer_history[addr] = []
-        self._deployer_history[addr].append(now)
-        # Count tokens in last 24h
+            self._deployer_history[addr] = {}
+        # Only record once per token (idempotent across multiple evaluate() calls)
+        if token_address not in self._deployer_history[addr]:
+            self._deployer_history[addr][token_address] = now
+        # Count unique tokens in last 24h
         cutoff = now - 86400
-        self._deployer_history[addr] = [
-            t for t in self._deployer_history[addr] if t > cutoff
-        ]
+        self._deployer_history[addr] = {
+            tok: ts for tok, ts in self._deployer_history[addr].items() if ts > cutoff
+        }
         return len(self._deployer_history[addr])
 
     def evict_stale(self):

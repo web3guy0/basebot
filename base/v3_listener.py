@@ -10,14 +10,14 @@ import asyncio
 import logging
 from eth_abi import decode
 
-from constants import (
+from base.constants import (
     V3_FACTORY,
     TOPIC_V3_POOL_CREATED,
     TOPIC_V3_SWAP,
     ETH_ADDRESSES,
     V3_POOL_ABI,
 )
-from price_utils import estimate_mcap, estimate_liquidity_usd
+from base.price_utils import estimate_mcap, estimate_liquidity_usd
 
 logger = logging.getLogger("v3_listener")
 
@@ -32,7 +32,7 @@ class V3Listener:
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
-        self.pool_to_token: dict[str, str] = {}
+        self.pool_to_token: dict[str, tuple[str, bool]] = {}  # pool_addr -> (token_addr, eth_is_token0)
         self._tracked_pools: set[str] = set()
 
     async def register_subscriptions(self):
@@ -62,14 +62,14 @@ class V3Listener:
 
         await self.w3.eth.subscribe(
             "logs",
-            {"address": V3_FACTORY, "topics": [[TOPIC_V3_POOL_CREATED]]},
+            {"address": V3_FACTORY, "topics": [TOPIC_V3_POOL_CREATED]},
             handler=on_pool_created,
             label="v3_pool_created",
         )
 
         await self.w3.eth.subscribe(
             "logs",
-            {"topics": [[TOPIC_V3_SWAP]]},
+            {"topics": [TOPIC_V3_SWAP]},
             handler=on_swap,
             label="v3_swap",
         )
@@ -120,7 +120,7 @@ class V3Listener:
             dex_version="v3",
         )
 
-        self.pool_to_token[pool_addr] = token_address.lower()
+        self.pool_to_token[pool_addr] = (token_address.lower(), eth_is_token0)
         self._tracked_pools.add(pool_addr)
 
         # Try to get initial price from slot0
@@ -138,9 +138,10 @@ class V3Listener:
 
     async def _handle_swap(self, log, pool_addr: str):
         """Swap on a tracked V3 pool."""
-        token_address = self.pool_to_token.get(pool_addr)
-        if not token_address:
+        entry = self.pool_to_token.get(pool_addr)
+        if not entry:
             return
+        token_address, eth_is_token0 = entry
 
         state = self.tracker.get(token_address)
         if state is None or state.signaled:
@@ -160,11 +161,15 @@ class V3Listener:
         state.sqrt_price_x96 = sqrt_price_x96
         eth_price = self.eth_price_fn()
 
-        abs0, abs1 = abs(amount0), abs(amount1)
-        eth_value = min(abs0, abs1) / 1e18
-        usd_value = eth_value * eth_price
+        # Precise ETH value using known token ordering
+        if eth_is_token0:
+            eth_value = abs(amount0) / 1e18
+            is_buy = amount0 > 0  # ETH entering pool → user buying meme token
+        else:
+            eth_value = abs(amount1) / 1e18
+            is_buy = amount1 > 0  # ETH entering pool → user buying meme token
 
-        is_buy = (amount0 > 0 and amount1 < 0) or (amount1 > 0 and amount0 < 0)
+        usd_value = eth_value * eth_price
 
         if is_buy:
             updated = self.tracker.record_buy(token_address, sender, usd_value)

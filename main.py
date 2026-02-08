@@ -19,14 +19,21 @@ from web3 import AsyncWeb3
 from web3.providers import WebSocketProvider
 
 import config
-from constants import WETH
-from state import TokenStateTracker
+from base.constants import WETH
+from base.state import TokenStateTracker
+from base.v4_listener import V4Listener
+from base.v3_listener import V3Listener
+from base.safety import SafetyChecker, run_safety_check
 from signal_engine import SignalEngine
-from v4_listener import V4Listener
-from v3_listener import V3Listener
-from dexscreener import DexScreenerEnricher
-from safety import SafetyChecker, run_safety_check
+from dexscreener import DexScreenerClient, DexScreenerEnricher, SolDexScreenerEnricher
 from telegram_sender import TelegramSender
+from post_mortem import PostMortemTracker
+
+# Solana imports (conditional on SOL_ENABLED)
+if config.SOL_ENABLED:
+    from solana.state import SolTokenStateTracker
+    from solana.listener import SolanaListener
+    from solana.safety import SolSafetyChecker, run_sol_safety_check
 
 # ── Logging ──
 logging.basicConfig(
@@ -78,24 +85,102 @@ class EthPriceOracle:
         return self.price
 
 
+class SolPriceOracle:
+    """Fetches SOL/USD price via DexScreener. Refreshes every 60s."""
+
+    def __init__(self):
+        self.price: float = 150.0  # default fallback
+
+    async def update(self):
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as session:
+                url = "https://api.dexscreener.com/tokens/v1/solana/So11111111111111111111111111111111111111112"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list):
+                            for pair in data:
+                                # Only use pairs where WSOL is the base token
+                                bt = pair.get("baseToken", {})
+                                if bt.get("address") != "So11111111111111111111111111111111111111112":
+                                    continue
+                                # Prefer stablecoin-quoted pairs for accuracy
+                                qt = pair.get("quoteToken", {})
+                                if qt.get("symbol") in ("USDC", "USDT"):
+                                    price_str = pair.get("priceUsd")
+                                    if price_str:
+                                        self.price = float(price_str)
+                                        logger.debug(f"SOL price: ${self.price:,.2f}")
+                                        return
+                            # Fallback: any pair where WSOL is base
+                            for pair in data:
+                                bt = pair.get("baseToken", {})
+                                if bt.get("address") == "So11111111111111111111111111111111111111112":
+                                    price_str = pair.get("priceUsd")
+                                    if price_str:
+                                        self.price = float(price_str)
+                                        logger.debug(f"SOL price (fallback): ${self.price:,.2f}")
+                                        return
+        except Exception as e:
+            logger.debug(f"SOL price fetch failed: {e}")
+
+    async def run_refresh_loop(self):
+        while True:
+            await self.update()
+            await asyncio.sleep(60)
+
+    def get_price(self) -> float:
+        return self.price
+
+
 class SignalDetector:
     """Main application — wires up all components and runs them concurrently."""
 
     def __init__(self):
+        # ── EVM ───────────────────────────────────────────────
         self.state_tracker = TokenStateTracker(max_age=300)
-        self.engine = SignalEngine(state_tracker=self.state_tracker)
+
+        # ── Solana (optional) ─────────────────────────────────
+        self.sol_state_tracker = (
+            SolTokenStateTracker(max_age=200) if config.SOL_ENABLED else None
+        )
+
+        # ── Shared engine (both chains push to same signal_queue) ──
+        self.engine = SignalEngine(
+            state_tracker=self.state_tracker,
+            sol_state_tracker=self.sol_state_tracker,
+        )
         self.eth_oracle = EthPriceOracle()
         self.dex_enricher = DexScreenerEnricher(self.state_tracker, self.engine)
+        self.post_mortem = PostMortemTracker(
+            dex_client=self.dex_enricher.client,
+            signal_engine=self.engine,
+        )
         self.telegram = TelegramSender(self.engine.signal_queue)
         self.w3 = None
         self._safety_checker = None
 
+        # ── Solana components ─────────────────────────────────
+        self.sol_enricher = None
+        self.sol_listener = None
+        self.sol_safety = None
+        self.sol_price_oracle = None
+        if config.SOL_ENABLED:
+            self.sol_price_oracle = SolPriceOracle()
+            self.sol_enricher = SolDexScreenerEnricher(
+                self.sol_state_tracker, self.engine
+            )
+
     async def start(self):
         logger.info("=" * 60)
         logger.info("  EARLY TOKEN SIGNAL DETECTOR")
-        logger.info(f"  Chain:      Base (8453)")
+        logger.info(f"  Chain:      Base (8453) + {'Solana' if config.SOL_ENABLED else 'Solana DISABLED'}")
         logger.info(f"  Mode:       {'DRY RUN' if config.DRY_RUN else 'LIVE'}")
-        logger.info(f"  Max age:    {config.MAX_TOKEN_AGE_SECONDS}s")
+        logger.info(f"  Max age:    {config.MAX_TOKEN_AGE_SECONDS}s (EVM) / {config.SOL_MAX_TOKEN_AGE_SECONDS}s (SOL)")
         logger.info(f"  Max mcap:   ${config.MAX_MCAP_USD:,.0f}")
         logger.info(f"  Min liq:    ${config.MIN_LIQUIDITY_USD:,.0f}")
         logger.info(f"  Min buys:   {config.MIN_BUYS}")
@@ -141,9 +226,47 @@ class SignalDetector:
                 asyncio.create_task(self._eviction_loop(), name="eviction"),
                 asyncio.create_task(self._safety_loop(), name="safety"),
                 asyncio.create_task(self._stats_loop(), name="stats"),
+                asyncio.create_task(self.post_mortem.start(), name="post_mortem"),
+                asyncio.create_task(self._signal_hook_loop(), name="signal_hook"),
             ]
 
             logger.info("All systems running. Waiting for new tokens...")
+
+            # ── Add Solana tasks if enabled ────────────────────
+            if config.SOL_ENABLED:
+                self.sol_safety = SolSafetyChecker(config.SOL_RPC_HTTP)
+                self.sol_listener = SolanaListener(
+                    wss_url=config.SOL_RPC_WSS,
+                    http_url=config.SOL_RPC_HTTP,
+                    state_tracker=self.sol_state_tracker,
+                    signal_engine=self.engine,
+                    sol_price_fn=self.sol_price_oracle.get_price,
+                    min_liquidity_sol=config.SOL_MIN_LIQUIDITY_SOL,
+                )
+                await self.sol_price_oracle.update()
+                logger.info(f"SOL price: ${self.sol_price_oracle.get_price():,.2f}")
+
+                tasks.extend([
+                    asyncio.create_task(
+                        self.sol_listener.start(), name="sol_listener"
+                    ),
+                    asyncio.create_task(
+                        self.sol_enricher.start(), name="sol_enricher"
+                    ),
+                    asyncio.create_task(
+                        self.sol_price_oracle.run_refresh_loop(), name="sol_price"
+                    ),
+                    asyncio.create_task(
+                        self._sol_eviction_loop(), name="sol_eviction"
+                    ),
+                    asyncio.create_task(
+                        self._sol_safety_loop(), name="sol_safety"
+                    ),
+                ])
+                logger.info(
+                    f"Solana pipeline active: listener + enricher + safety "
+                    f"(min liq {config.SOL_MIN_LIQUIDITY_SOL} SOL)"
+                )
 
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for task in done:
@@ -152,10 +275,45 @@ class SignalDetector:
             for task in pending:
                 task.cancel()
 
+    async def _signal_hook_loop(self):
+        """Watch for new signals and schedule post-mortem follow-ups."""
+        seen_signals: set[str] = set()
+        while True:
+            # EVM signals
+            for addr, state in list(self.state_tracker.states.items()):
+                if state.signaled and addr not in seen_signals:
+                    seen_signals.add(addr)
+                    latency = state.signal_time - state.first_seen
+                    self.post_mortem.schedule(
+                        token_address=addr,
+                        mcap_at_signal=state.best_mcap,
+                        latency=latency,
+                        chain="base",
+                    )
+            # Solana signals
+            if self.sol_state_tracker:
+                for addr, state in list(self.sol_state_tracker.states.items()):
+                    if state.signaled and addr not in seen_signals:
+                        seen_signals.add(addr)
+                        latency = state.signal_time - state.first_seen
+                        self.post_mortem.schedule(
+                            token_address=addr,
+                            mcap_at_signal=state.best_mcap,
+                            latency=latency,
+                            chain="solana",
+                        )
+            await asyncio.sleep(2)
+
     async def _eviction_loop(self):
         while True:
             self.state_tracker.evict_stale()
             await asyncio.sleep(30)
+
+    async def _sol_eviction_loop(self):
+        while True:
+            if self.sol_state_tracker:
+                self.sol_state_tracker.evict_stale()
+            await asyncio.sleep(20)  # faster eviction for Solana
 
     async def _safety_loop(self):
         checked: set[str] = set()
@@ -166,13 +324,37 @@ class SignalDetector:
                     continue
                 asyncio.create_task(run_safety_check(self._safety_checker, state))
                 checked.add(addr)
+            # Prune checked set: remove addresses no longer in tracker (evicted)
+            checked &= set(self.state_tracker.states.keys())
+            await asyncio.sleep(2)
+
+    async def _sol_safety_loop(self):
+        """Run mint/freeze authority checks for new Solana tokens."""
+        checked: set[str] = set()
+        while True:
+            if self.sol_state_tracker and self.sol_safety:
+                for addr, state in list(self.sol_state_tracker.states.items()):
+                    if addr in checked or state.bytecode_safe is not None:
+                        checked.add(addr)
+                        continue
+                    asyncio.create_task(
+                        run_sol_safety_check(self.sol_safety, state)
+                    )
+                    checked.add(addr)
+                # Prune checked set: remove addresses no longer in tracker (evicted)
+                checked &= set(self.sol_state_tracker.states.keys())
             await asyncio.sleep(2)
 
     async def _stats_loop(self):
         while True:
             await asyncio.sleep(300)
             stats = self.engine.get_stats()
-            active = self.state_tracker.active_count
+            active_evm = self.state_tracker.active_count
+            active_sol = (
+                self.sol_state_tracker.active_count
+                if self.sol_state_tracker
+                else 0
+            )
             latency_str = ""
             if "avg_latency_s" in stats:
                 latency_str = (
@@ -181,10 +363,18 @@ class SignalDetector:
                     f" max={stats['max_latency_s']}s"
                 )
             logger.info(
-                f"[stats] active={active} evaluated={stats['evaluated']} "
+                f"[stats] evm={active_evm} sol={active_sol} "
+                f"evaluated={stats['evaluated']} "
                 f"signaled={stats['signaled']} rejected={stats['rejected']} "
                 f"signals_this_hr={stats['signals_this_hour']}{latency_str}"
             )
+            if stats.get("latency_distribution"):
+                logger.info(f"[stats] latency buckets: {stats['latency_distribution']}")
+            if stats.get("post_mortem_count"):
+                logger.info(
+                    f"[stats] post-mortems: {stats['post_mortem_count']} "
+                    f"TP_hit={stats['tp_hit_rate']} rugs={stats['rug_rate']}"
+                )
             if stats["reject_reasons"]:
                 top = sorted(stats["reject_reasons"].items(), key=lambda x: -x[1])[:5]
                 logger.info(f"[stats] top rejections: {dict(top)}")
@@ -202,10 +392,22 @@ async def _shutdown(detector: SignalDetector):
     logger.info("Shutting down...")
     if detector.dex_enricher:
         await detector.dex_enricher.stop()
+    if detector.post_mortem:
+        await detector.post_mortem.stop()
     if detector.telegram:
         await detector.telegram.stop()
+    # Solana cleanup
+    if detector.sol_enricher:
+        await detector.sol_enricher.stop()
+    if detector.sol_listener:
+        await detector.sol_listener.stop()
+    if detector.sol_safety:
+        await detector.sol_safety.close()
     logger.info("Goodbye.")
-    sys.exit(0)
+    # Cancel all running tasks for clean exit
+    for task in asyncio.all_tasks():
+        if task is not asyncio.current_task():
+            task.cancel()
 
 
 if __name__ == "__main__":

@@ -62,12 +62,12 @@ class DexScreenerClient:
                 logger.debug(f"DexScreener request failed: {e}")
                 return None
 
-    async def get_token_pairs(self, token_address: str) -> list[dict]:
+    async def get_token_pairs(self, token_address: str, chain: str = "base") -> list[dict]:
         """
-        Fetch all pairs for a token on Base.
+        Fetch all pairs for a token on a given chain.
         Returns list of pair objects with mcap, liquidity, txns, etc.
         """
-        url = f"{BASE_URL}/tokens/v1/base/{token_address}"
+        url = f"{BASE_URL}/tokens/v1/{chain}/{token_address}"
         data = await self._rate_limited_get(url)
         if data is None:
             return []
@@ -176,4 +176,93 @@ class DexScreenerEnricher:
             )
 
             # Re-evaluate signal with enriched data
+            await self.engine.evaluate(state)
+
+
+class SolDexScreenerEnricher:
+    """
+    DexScreener enrichment for Solana tokens.
+
+    Same pattern as the EVM enricher: polls active non-signaled tokens
+    on an interval, fills ds_mcap / ds_liquidity_usd / ds_buys_m5, then
+    re-evaluates through the shared signal engine.
+    """
+
+    def __init__(self, state_tracker, signal_engine, poll_interval: float = 8.0):
+        self.tracker = state_tracker
+        self.engine = signal_engine
+        self.client = DexScreenerClient()
+        self.poll_interval = poll_interval
+        self._running = False
+
+    async def start(self):
+        self._running = True
+        logger.info(
+            f"Solana DexScreener enricher started (poll every {self.poll_interval}s)"
+        )
+        while self._running:
+            try:
+                await self._enrich_cycle()
+            except Exception as e:
+                logger.error(f"Solana DexScreener enrichment error: {e}")
+            await asyncio.sleep(self.poll_interval)
+
+    async def stop(self):
+        self._running = False
+        await self.client.close()
+
+    async def _enrich_cycle(self):
+        now = time.time()
+        tokens_to_enrich = []
+
+        for addr, state in list(self.tracker.states.items()):
+            if state.signaled:
+                continue
+            if state.age_seconds > 160:
+                continue
+            if now - state.ds_last_fetch < self.poll_interval:
+                continue
+            tokens_to_enrich.append(addr)
+
+        if not tokens_to_enrich:
+            return
+
+        logger.debug(
+            f"Enriching {len(tokens_to_enrich)} Solana tokens via DexScreener"
+        )
+
+        for addr in tokens_to_enrich:
+            state = self.tracker.get(addr)
+            if state is None or state.signaled:
+                continue
+
+            pairs = await self.client.get_token_pairs(addr, chain="solana")
+            if not pairs:
+                continue
+
+            best_pair = max(
+                pairs,
+                key=lambda p: (p.get("liquidity") or {}).get("usd", 0),
+            )
+
+            liquidity = best_pair.get("liquidity", {})
+            state.ds_liquidity_usd = liquidity.get("usd")
+            state.ds_mcap = best_pair.get("marketCap") or best_pair.get("fdv")
+
+            txns = best_pair.get("txns", {})
+            m5 = txns.get("m5", {})
+            state.ds_buys_m5 = m5.get("buys")
+            state.ds_sells_m5 = m5.get("sells")
+
+            volume = best_pair.get("volume", {})
+            state.ds_volume_m5 = volume.get("m5")
+
+            state.ds_last_fetch = time.time()
+
+            logger.debug(
+                f"[sol-ds] {addr[:8]}... mcap=${state.ds_mcap} "
+                f"liq=${state.ds_liquidity_usd} "
+                f"buys={state.ds_buys_m5} sells={state.ds_sells_m5}"
+            )
+
             await self.engine.evaluate(state)
