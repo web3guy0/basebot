@@ -1,11 +1,11 @@
 module.exports = {
   apps: [
     {
-      name: "signal-detector",
-      script: "python3",
+      name: "basebot",
+      script: "/root/basebot/venv/bin/python3",  // venv Python (has all deps)
       args: "main.py",
       cwd: "/root/basebot",           // ← change to your VPS path
-      interpreter: "none",             // we specify python3 as the script directly
+      interpreter: "none",             // script IS the interpreter
       autorestart: true,
       watch: false,
       max_restarts: 50,

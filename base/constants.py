@@ -28,13 +28,12 @@ V4_POOL_MANAGER = Web3.to_checksum_address("0x498581fF718922c3f8e6A244956aF099B2
 V4_QUOTER = Web3.to_checksum_address("0x0d5e0f971ed27fbff6c2837bf31316121532048d")
 V4_UNIVERSAL_ROUTER = Web3.to_checksum_address("0x6ff5693b99212da76ad316178a184ab56d299b43")
 
-# ── Hooks Whitelist (Option C) ──────────────────────────────────
-# Only pools whose hooks address is in this set are considered safe.
-# address(0) = no hooks = safe by default.
-# Add known-safe hook contracts here as the V4 ecosystem matures.
-SAFE_HOOKS = {
-    ETH_NATIVE,  # address(0) → no hooks
-}
+# ── Hooks Blacklist ───────────────────────────────────────────────
+# V4 pools with hooks in this set are hard-rejected.
+# Standard fee/routing hooks are allowed — real safety comes from
+# bytecode analysis + DexScreener sell-ratio checks.
+# Add known-malicious hooks here as they emerge.
+BLOCKED_HOOKS: set[str] = set()
 
 # Addresses that represent ETH (native or wrapped) for pair filtering
 ETH_ADDRESSES = {

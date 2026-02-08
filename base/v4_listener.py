@@ -14,7 +14,7 @@ from base.constants import (
     TOPIC_V4_INITIALIZE,
     TOPIC_V4_SWAP,
     ETH_ADDRESSES,
-    SAFE_HOOKS,
+    BLOCKED_HOOKS,
 )
 from base.price_utils import estimate_mcap, estimate_liquidity_usd
 
@@ -99,14 +99,15 @@ class V4Listener:
         else:
             hooks_lower = str(hooks_raw).lower()
 
-        # Hooks safety check (Option C: whitelist)
-        if hooks_lower not in SAFE_HOOKS:
-            logger.info(f"[v4-skip] Pool {pool_id[:16]}... unknown hooks: {hooks_lower[:16]}...")
+        # Hooks safety check (blacklist: reject known-malicious, allow standard hooks)
+        if hooks_lower in BLOCKED_HOOKS:
+            logger.info(f"[v4-skip] Pool {pool_id[:16]}... blocked hooks: {hooks_lower[:16]}...")
             return
 
+        has_hooks = not hooks_lower.endswith('0' * 40)
         logger.info(
             f"[v4-init] New pool | token={token_address[:10]}... | "
-            f"fee={fee} | tick={tick} | hooks={'none' if hooks_lower.endswith('0'*40) else hooks_lower[:10]}"
+            f"fee={fee} | tick={tick} | hooks={'none' if not has_hooks else hooks_lower[:16]}..."
         )
 
         state = self.tracker.create(
