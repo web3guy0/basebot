@@ -100,10 +100,11 @@ class DexScreenerEnricher:
     to get mcap/liquidity/volume data until the token ages out.
     """
 
-    def __init__(self, state_tracker, signal_engine, poll_interval: float = 8.0):
+    def __init__(self, state_tracker, signal_engine, poll_interval: float = 8.0, client: DexScreenerClient | None = None):
         self.tracker = state_tracker
         self.engine = signal_engine
-        self.client = DexScreenerClient()
+        self.client = client or DexScreenerClient()
+        self._owns_client = client is None  # only close if we created it
         self.poll_interval = poll_interval
         self._running = False
 
@@ -121,7 +122,8 @@ class DexScreenerEnricher:
 
     async def stop(self):
         self._running = False
-        await self.client.close()
+        if self._owns_client:
+            await self.client.close()
 
     async def _enrich_cycle(self):
         """Enrich all active (non-signaled, non-stale) tokens."""
@@ -188,10 +190,11 @@ class SolDexScreenerEnricher:
     re-evaluates through the shared signal engine.
     """
 
-    def __init__(self, state_tracker, signal_engine, poll_interval: float = 8.0):
+    def __init__(self, state_tracker, signal_engine, poll_interval: float = 8.0, client: DexScreenerClient | None = None):
         self.tracker = state_tracker
         self.engine = signal_engine
-        self.client = DexScreenerClient()
+        self.client = client or DexScreenerClient()
+        self._owns_client = client is None  # only close if we created it
         self.poll_interval = poll_interval
         self._running = False
 
@@ -209,7 +212,8 @@ class SolDexScreenerEnricher:
 
     async def stop(self):
         self._running = False
-        await self.client.close()
+        if self._owns_client:
+            await self.client.close()
 
     async def _enrich_cycle(self):
         now = time.time()

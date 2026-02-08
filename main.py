@@ -155,9 +155,10 @@ class SignalDetector:
             sol_state_tracker=self.sol_state_tracker,
         )
         self.eth_oracle = EthPriceOracle()
-        self.dex_enricher = DexScreenerEnricher(self.state_tracker, self.engine)
+        self._shared_dex_client = DexScreenerClient()  # single client for all DexScreener calls
+        self.dex_enricher = DexScreenerEnricher(self.state_tracker, self.engine, client=self._shared_dex_client)
         self.post_mortem = PostMortemTracker(
-            dex_client=self.dex_enricher.client,
+            dex_client=self._shared_dex_client,
             signal_engine=self.engine,
         )
         self.telegram = TelegramSender(self.engine.signal_queue)
@@ -172,7 +173,7 @@ class SignalDetector:
         if config.SOL_ENABLED:
             self.sol_price_oracle = SolPriceOracle()
             self.sol_enricher = SolDexScreenerEnricher(
-                self.sol_state_tracker, self.engine
+                self.sol_state_tracker, self.engine, client=self._shared_dex_client
             )
 
     async def start(self):
@@ -207,12 +208,12 @@ class SignalDetector:
             logger.info(f"ETH price: ${self.eth_oracle.get_price():,.0f}")
 
             # Build listeners (they share the same w3 + subscription manager)
-            v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
-            v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
+            self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
+            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price)
 
             # Register all subscriptions (V4 + V3), then run handler once
-            await v4.register_subscriptions()
-            await v3.register_subscriptions()
+            await self._v4.register_subscriptions()
+            await self._v3.register_subscriptions()
 
             # Launch background tasks
             tasks = [
@@ -302,12 +303,38 @@ class SignalDetector:
                             latency=latency,
                             chain="solana",
                         )
+            # Prune: remove addresses evicted from both trackers
+            active = set(self.state_tracker.states.keys())
+            if self.sol_state_tracker:
+                active |= set(self.sol_state_tracker.states.keys())
+            seen_signals &= active
             await asyncio.sleep(2)
 
     async def _eviction_loop(self):
         while True:
             self.state_tracker.evict_stale()
+            # Prune listener pool mappings for evicted tokens
+            self._prune_listener_pools()
             await asyncio.sleep(30)
+
+    def _prune_listener_pools(self):
+        """Remove V3/V4 pool mappings for tokens no longer in state tracker."""
+        active = set(self.state_tracker.states.keys())
+        if hasattr(self, '_v3') and self._v3:
+            stale_pools = [
+                p for p, (tok, _) in list(self._v3.pool_to_token.items())
+                if tok not in active
+            ]
+            for p in stale_pools:
+                self._v3.pool_to_token.pop(p, None)
+                self._v3._tracked_pools.discard(p)
+        if hasattr(self, '_v4') and self._v4:
+            stale_pools = [
+                p for p, (tok, _) in list(self._v4.pool_id_to_token.items())
+                if tok not in active
+            ]
+            for p in stale_pools:
+                self._v4.pool_id_to_token.pop(p, None)
 
     async def _sol_eviction_loop(self):
         while True:
@@ -403,6 +430,9 @@ async def _shutdown(detector: SignalDetector):
         await detector.sol_listener.stop()
     if detector.sol_safety:
         await detector.sol_safety.close()
+    # Close shared DexScreener client last
+    if detector._shared_dex_client:
+        await detector._shared_dex_client.close()
     logger.info("Goodbye.")
     # Cancel all running tasks for clean exit
     for task in asyncio.all_tasks():

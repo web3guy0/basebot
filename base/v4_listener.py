@@ -115,6 +115,8 @@ class V4Listener:
             dex_version="v4",
             hooks_address=hooks_lower,
             sqrt_price_x96=sqrt_price_x96,
+            # NOTE: deployer not extracted — would need extra eth_getTransaction RPC.
+            # EVM deployer spam is rare (gas cost), bytecode safety compensates.
         )
         self.pool_id_to_token[pool_id] = (token_address.lower(), eth_is_token0)
 

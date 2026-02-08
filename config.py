@@ -27,7 +27,6 @@ MIN_LARGEST_BUY_PCT = float(os.getenv("MIN_LARGEST_BUY_PCT", "10"))  # % of liqu
 MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "5"))
 
 # ── Anti-Spam ──────────────────────────────────────────────────
-IGNORE_LIQUIDITY_BELOW_USD = float(os.getenv("IGNORE_LIQUIDITY_BELOW_USD", "2000"))
 MAX_DEPLOYER_TOKENS_24H = int(os.getenv("MAX_DEPLOYER_TOKENS_24H", "2"))
 # ── Latency Cutoff ─────────────────────────────────────────────────
 # If signal latency (pool creation → signal) exceeds this, skip it.

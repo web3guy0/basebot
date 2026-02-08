@@ -118,6 +118,8 @@ class V3Listener:
             token_address=token_address,
             pair_address=pool_addr,
             dex_version="v3",
+            # NOTE: deployer not extracted — would need extra eth_getTransaction RPC.
+            # EVM deployer spam is rare (gas cost), bytecode safety compensates.
         )
 
         self.pool_to_token[pool_addr] = (token_address.lower(), eth_is_token0)
