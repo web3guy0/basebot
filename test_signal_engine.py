@@ -44,6 +44,7 @@ def make_evm_state(**overrides) -> TokenState:
     state.largest_buy_usd = defaults["largest_buy_usd"]
     state.bytecode_safe = defaults["bytecode_safe"]
     state.deployer_address = defaults["deployer_address"]
+    state.unique_buyers = {"0xbuyer1", "0xbuyer2"}  # satisfy MIN_UNIQUE_BUYERS
     return state
 
 
@@ -74,6 +75,7 @@ def make_sol_state(**overrides) -> SolTokenState:
     state.buy_volume_usd = defaults["buy_volume_usd"]
     state.largest_buy_usd = defaults["largest_buy_usd"]
     state.deployer_address = defaults["deployer_address"]
+    state.unique_buyers = {"buyer_wallet_1", "buyer_wallet_2"}  # satisfy MIN_UNIQUE_BUYERS
     # Both authorities revoked = safe
     state.mint_authority = None
     state.freeze_authority = None

@@ -150,7 +150,16 @@ class SignalBot:
             momentum = state.has_momentum()
             dex_ver = state.dex_version
             latency = time.time() - state.first_seen
-            name_tag = f" ${state.token_symbol}" if state.token_symbol else ""
+
+            # Header: show name + symbol if available
+            if state.token_name and state.token_symbol:
+                name_tag = f" {state.token_name} (${state.token_symbol})"
+            elif state.token_symbol:
+                name_tag = f" ${state.token_symbol}"
+            elif state.token_name:
+                name_tag = f" {state.token_name}"
+            else:
+                name_tag = ""
             social_tag = "" if state.has_socials else " ⚠️no-socials"
 
             message = (

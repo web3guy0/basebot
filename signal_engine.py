@@ -27,6 +27,9 @@ class SignalEngine:
         # Persistent record of every signaled token + mcap at signal time
         # (survives eviction — used by volume scanner for "previously signaled" context)
         self.signaled_history: dict[str, float] = {}  # token_addr -> mcap_at_signal
+        # Same-symbol cooldown: symbol -> last signal timestamp
+        # Prevents signaling 2+ tokens with identical names (e.g. 3 "PEPE" tokens)
+        self._symbol_cooldowns: dict[str, float] = {}
         # Anti-spam: track signals per hour
         self._signal_timestamps: list[float] = []
         # Stats
@@ -132,6 +135,20 @@ class SignalEngine:
             self._reject(token, "copycat", f"name={state.token_symbol}")
             return False
 
+        # Same-symbol cooldown — if we already signaled a token with this exact
+        # symbol recently, reject. Prevents buying 2-3 identical-name tokens.
+        if state.token_symbol:
+            sym_key = state.token_symbol.upper()
+            last_signal_time = self._symbol_cooldowns.get(sym_key)
+            if last_signal_time and now - last_signal_time < config.SAME_SYMBOL_COOLDOWN_S:
+                self._reject(token, "dup_symbol", f"${state.token_symbol} already signaled {now - last_signal_time:.0f}s ago")
+                return False
+
+        # Minimum unique buyers — require different wallets, not just total buys
+        if len(state.unique_buyers) < config.MIN_UNIQUE_BUYERS:
+            self._reject(token, "few_unique_buyers", f"unique={len(state.unique_buyers)}")
+            return False
+
         # No socials warning — don't reject, but track (useful for analysis)
         # (real new tokens rarely have socials, so this is informational only)
 
@@ -156,6 +173,15 @@ class SignalEngine:
         self._signal_timestamps.append(now)
         self.total_signaled += 1
         self.signaled_history[state.token_address] = mcap
+
+        # Record symbol cooldown
+        if state.token_symbol:
+            self._symbol_cooldowns[state.token_symbol.upper()] = now
+            # Prune old cooldowns
+            cutoff = now - config.SAME_SYMBOL_COOLDOWN_S
+            self._symbol_cooldowns = {
+                s: t for s, t in self._symbol_cooldowns.items() if t > cutoff
+            }
 
         # Track time-to-signal (pool creation → signal fire)
         self._signal_latencies.append(time_to_signal)

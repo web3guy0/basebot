@@ -34,6 +34,14 @@ MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "5"))
 # ── Anti-Spam ──────────────────────────────────────────────────
 MAX_DEPLOYER_TOKENS_24H = int(os.getenv("MAX_DEPLOYER_TOKENS_24H", "2"))
 
+# Same-symbol cooldown: if bot just signaled $PEPE, reject another $PEPE
+# for this many seconds. Prevents buying 2-3 tokens with identical names.
+SAME_SYMBOL_COOLDOWN_S = int(os.getenv("SAME_SYMBOL_COOLDOWN_S", "1800"))
+
+# Minimum UNIQUE buyer wallets required to signal (not just total buys).
+# Prevents single-wallet pump fakes from triggering.
+MIN_UNIQUE_BUYERS = int(os.getenv("MIN_UNIQUE_BUYERS", "2"))
+
 # ── Whale Alert ────────────────────────────────────────────────
 # Minimum swap USD value to trigger a whale alert on tracked tokens
 WHALE_ALERT_MIN_USD = float(os.getenv("WHALE_ALERT_MIN_USD", "500"))
