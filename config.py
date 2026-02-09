@@ -49,6 +49,12 @@ WHALE_ALERT_MIN_USD = float(os.getenv("WHALE_ALERT_MIN_USD", "500"))
 # ── Volume Spike Scanner ──────────────────────────────────────
 # Detect old tokens suddenly getting volume spikes (piggybacks on V3 global Swap sub)
 VOLUME_SPIKE_ENABLED = os.getenv("VOLUME_SPIKE_ENABLED", "true").lower() == "true"
+
+# ── Discovery Feed ────────────────────────────────────────────
+# Shows every new WETH pair on personal bot (no auto-buy). Manual research.
+DISCOVERY_FEED_ENABLED = os.getenv("DISCOVERY_FEED_ENABLED", "true").lower() == "true"
+DISCOVERY_MAX_PER_HOUR = int(os.getenv("DISCOVERY_MAX_PER_HOUR", "30"))
+
 # ── Latency Cutoff ─────────────────────────────────────────────────
 # If signal latency (pool creation → signal) exceeds this, skip it.
 # Set to 0 to disable (allow any latency within MAX_TOKEN_AGE_SECONDS).

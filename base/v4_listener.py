@@ -25,12 +25,13 @@ logger = logging.getLogger("v4_listener")
 class V4Listener:
     """Listens to Uniswap V4 PoolManager for Initialize + Swap events."""
 
-    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None):
+    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, discovery_queue=None):
         self.w3 = w3
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
         self.whale_queue = whale_queue
+        self.discovery_queue = discovery_queue
         self.pool_id_to_token: dict[str, tuple[str, bool]] = {}  # pool_id -> (token_addr, eth_is_token0)
 
     async def register_subscriptions(self):
@@ -122,6 +123,15 @@ class V4Listener:
             # EVM deployer spam is rare (gas cost), bytecode safety compensates.
         )
         self.pool_id_to_token[pool_id] = (token_address.lower(), eth_is_token0)
+
+        # Push to discovery feed (personal bot — no auto-buy)
+        if self.discovery_queue:
+            self.discovery_queue.put_nowait({
+                "token": token_address,
+                "pool": pool_id,
+                "dex": "v4",
+                "hooks": hooks_lower if has_hooks else None,
+            })
 
         if sqrt_price_x96 > 0:
             estimate_mcap(state, sqrt_price_x96, eth_is_token0, self.eth_price_fn())

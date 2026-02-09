@@ -29,10 +29,11 @@ class SignalBot:
     Consumes from the shared signal_queue (same as TelegramSender).
     """
 
-    def __init__(self, signal_queue: asyncio.Queue, state_tracker=None, sol_state_tracker=None, whale_queue=None, pump_queue=None):
+    def __init__(self, signal_queue: asyncio.Queue, state_tracker=None, sol_state_tracker=None, whale_queue=None, pump_queue=None, discovery_queue=None):
         self.signal_queue = signal_queue
         self.whale_queue = whale_queue
         self.pump_queue = pump_queue
+        self.discovery_queue = discovery_queue
         self.tracker = state_tracker
         self.sol_tracker = sol_state_tracker
         self._session: Optional[aiohttp.ClientSession] = None
@@ -81,12 +82,14 @@ class SignalBot:
             f"Min liq: ${config.MIN_LIQUIDITY_USD:,.0f}"
         )
 
-        # Consume signals + whale alerts + pump alerts
+        # Consume signals + whale alerts + pump alerts + discovery feed
         tasks = [asyncio.create_task(self._send_loop())]
         if self.whale_queue:
             tasks.append(asyncio.create_task(self._whale_loop()))
         if self.pump_queue:
             tasks.append(asyncio.create_task(self._pump_loop()))
+        if self.discovery_queue:
+            tasks.append(asyncio.create_task(self._discovery_loop()))
         await asyncio.gather(*tasks)
 
     async def _send_loop(self):
@@ -449,6 +452,98 @@ class SignalBot:
             f"├ Swaps/2m: <b>{swaps}</b>\n"
             f"└ Age: {age_str}"
             f"{signal_line}"
+        )
+        await self._send_message(message, reply_markup=keyboard)
+
+    # ── Discovery Feed ──────────────────────────────────────────
+
+    async def _discovery_loop(self):
+        """Consume new-pair discoveries and send lightweight notifications.
+        Rate limited: min 5s between messages, max DISCOVERY_MAX_PER_HOUR/hr."""
+        _timestamps: list[float] = []
+        _last_send: float = 0.0
+        MIN_INTERVAL = 5  # seconds between discovery messages
+        MAX_PER_HOUR = config.DISCOVERY_MAX_PER_HOUR
+
+        while True:
+            try:
+                event = await self.discovery_queue.get()
+                now = time.time()
+
+                # Rate limit: prune old timestamps, check hourly cap
+                _timestamps = [t for t in _timestamps if now - t < 3600]
+                if len(_timestamps) >= MAX_PER_HOUR:
+                    self.discovery_queue.task_done()
+                    continue
+
+                # Min interval between messages
+                wait = MIN_INTERVAL - (now - _last_send)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
+                await self._send_discovery(event)
+                _last_send = time.time()
+                _timestamps.append(_last_send)
+                self.discovery_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Discovery loop error: {e}")
+                await asyncio.sleep(1)
+
+    async def _send_discovery(self, event: dict):
+        """Send a lightweight new-pair discovery notification."""
+        token = event.get("token", "?")
+        pool = event.get("pool", "")
+        dex = event.get("dex", "?")
+        fee = event.get("fee")
+        hooks = event.get("hooks")
+
+        # Look up state for mcap/liq if available
+        state = self.tracker.get(token) if self.tracker else None
+        mcap = state.best_mcap if state else 0
+        liq = state.best_liquidity if state else 0
+        name = state.token_name if state and state.token_name else ""
+        symbol = state.token_symbol if state and state.token_symbol else ""
+
+        # Header
+        if name and symbol:
+            title = f" {name} (${symbol})"
+        elif symbol:
+            title = f" ${symbol}"
+        elif name:
+            title = f" {name}"
+        else:
+            title = ""
+
+        ds_link = f"https://dexscreener.com/base/{token}"
+        explorer_link = f"https://basescan.org/token/{token}"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 DexScreener", "url": ds_link},
+                    {"text": "🔍 Explorer", "url": explorer_link},
+                ],
+            ]
+        }
+
+        # Info line
+        info_parts = [dex.upper()]
+        if fee:
+            info_parts.append(f"fee={fee}")
+        if hooks:
+            info_parts.append(f"hooks={hooks[:10]}..")
+        if mcap > 0:
+            info_parts.append(f"mcap=${mcap:,.0f}")
+        if liq > 0:
+            info_parts.append(f"liq=${liq:,.0f}")
+        info_str = " · ".join(info_parts)
+
+        message = (
+            f"📡 <b>NEW PAIR</b>{title}\n"
+            f"<code>{token}</code>\n"
+            f"{info_str}"
         )
         await self._send_message(message, reply_markup=keyboard)
 

@@ -176,12 +176,15 @@ class SignalDetector:
         self._whale_queue: asyncio.Queue[dict] = asyncio.Queue()
         # Pump / volume spike alert queue
         self._pump_queue: asyncio.Queue[dict] = asyncio.Queue()
+        # Discovery feed queue — every new WETH pair, personal bot only
+        self._discovery_queue: asyncio.Queue[dict] = asyncio.Queue() if config.DISCOVERY_FEED_ENABLED else None
         self.signal_bot = SignalBot(
             self._personalbot_queue,
             state_tracker=self.state_tracker,
             sol_state_tracker=self.sol_state_tracker,
             whale_queue=self._whale_queue,
             pump_queue=self._pump_queue,
+            discovery_queue=self._discovery_queue,
         )
 
         # Volume spike scanner (piggybacks on V3 global swap subscription)
@@ -237,8 +240,8 @@ class SignalDetector:
             logger.info(f"\u2713 ETH=${self.eth_oracle.get_price():,.0f}")
 
             # Build listeners (they share the same w3 + subscription manager)
-            self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue)
-            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self.volume_scanner)
+            self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self._discovery_queue)
+            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self.volume_scanner, self._discovery_queue)
 
             # Register all subscriptions (V4 + V3), then run handler once
             await self._v4.register_subscriptions()

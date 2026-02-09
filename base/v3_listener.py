@@ -28,13 +28,14 @@ ALLOWED_FEE_TIERS = {3000, 10000}
 class V3Listener:
     """Listens to V3 Factory for PoolCreated, then Swaps on new pools."""
 
-    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, volume_scanner=None):
+    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, volume_scanner=None, discovery_queue=None):
         self.w3 = w3
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
         self.whale_queue = whale_queue
         self.volume_scanner = volume_scanner
+        self.discovery_queue = discovery_queue
         self.pool_to_token: dict[str, tuple[str, bool]] = {}  # pool_addr -> (token_addr, eth_is_token0)
         self._tracked_pools: set[str] = set()
 
@@ -129,6 +130,15 @@ class V3Listener:
 
         self.pool_to_token[pool_addr] = (token_address.lower(), eth_is_token0)
         self._tracked_pools.add(pool_addr)
+
+        # Push to discovery feed (personal bot — no auto-buy)
+        if self.discovery_queue:
+            self.discovery_queue.put_nowait({
+                "token": token_address,
+                "pool": pool_addr,
+                "dex": "v3",
+                "fee": fee,
+            })
 
         # Try to get initial price from slot0
         try:
