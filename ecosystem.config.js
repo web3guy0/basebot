@@ -8,8 +8,8 @@ module.exports = {
       interpreter: "none",             // script IS the interpreter
       autorestart: true,
       watch: false,
-      max_restarts: 50,
-      restart_delay: 5000,             // 5s between restarts
+      max_restarts: 20,
+      restart_delay: 30000,            // 30s between restarts (avoid rate limit loops)
       max_memory_restart: "500M",
       env: {
         PYTHONUNBUFFERED: "1",         // force unbuffered output for real-time logs

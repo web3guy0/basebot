@@ -525,7 +525,23 @@ async def main():
     loop = asyncio.get_event_loop()
     for sig in (signal_module.SIGINT, signal_module.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown(detector)))
-    await detector.start()
+
+    # Retry with exponential backoff on connection failure (429, network errors)
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            await detector.start()
+            break  # Clean exit
+        except Exception as e:
+            backoff = min(30 * attempt, 300)  # 30s, 60s, 90s... up to 5min
+            logger.error(
+                f"Connection failed (attempt {attempt}/{max_retries}): {e}\n"
+                f"Retrying in {backoff}s..."
+            )
+            if attempt == max_retries:
+                logger.error("Max retries exceeded. Exiting.")
+                sys.exit(1)
+            await asyncio.sleep(backoff)
 
 
 async def _shutdown(detector: SignalDetector):
