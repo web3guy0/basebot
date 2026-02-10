@@ -458,33 +458,66 @@ class SignalBot:
     # ── Discovery Feed ──────────────────────────────────────────
 
     async def _discovery_loop(self):
-        """Consume new-pair discoveries and send lightweight notifications.
+        """Consume new-pair discoveries, delay for enrichment, then send.
+        Waits ~15s after pool creation for DexScreener to index the pair,
+        giving us token name, symbol, mcap, liquidity, and socials.
         Rate limited: min 5s between messages, max DISCOVERY_MAX_PER_HOUR/hr."""
         _timestamps: list[float] = []
         _last_send: float = 0.0
         MIN_INTERVAL = 5  # seconds between discovery messages
         MAX_PER_HOUR = config.DISCOVERY_MAX_PER_HOUR
+        ENRICHMENT_DELAY = 15  # seconds to wait for DexScreener data
+        MIN_DISCOVERY_MCAP = 500  # skip dust/dead pairs (no real buys)
+
+        # Buffer: collect events, process after delay
+        pending: list[tuple[float, dict]] = []  # (arrival_time, event)
 
         while True:
             try:
-                event = await self.discovery_queue.get()
+                # Drain queue without blocking — collect new events
+                while not self.discovery_queue.empty():
+                    try:
+                        event = self.discovery_queue.get_nowait()
+                        pending.append((time.time(), event))
+                        self.discovery_queue.task_done()
+                    except Exception:
+                        break
+
+                # Process events that have aged past the enrichment delay
                 now = time.time()
+                ready = [p for p in pending if now - p[0] >= ENRICHMENT_DELAY]
+                pending = [p for p in pending if now - p[0] < ENRICHMENT_DELAY]
 
-                # Rate limit: prune old timestamps, check hourly cap
-                _timestamps = [t for t in _timestamps if now - t < 3600]
-                if len(_timestamps) >= MAX_PER_HOUR:
-                    self.discovery_queue.task_done()
-                    continue
+                for arrival_time, event in ready:
+                    # Rate limit: prune old timestamps, check hourly cap
+                    _timestamps = [t for t in _timestamps if now - t < 3600]
+                    if len(_timestamps) >= MAX_PER_HOUR:
+                        continue
 
-                # Min interval between messages
-                wait = MIN_INTERVAL - (now - _last_send)
-                if wait > 0:
-                    await asyncio.sleep(wait)
+                    # Min interval between messages
+                    wait = MIN_INTERVAL - (now - _last_send)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
 
-                await self._send_discovery(event)
-                _last_send = time.time()
-                _timestamps.append(_last_send)
-                self.discovery_queue.task_done()
+                    # Check if token has enough data now
+                    token = event.get("token", "")
+                    state = self.tracker.get(token) if self.tracker else None
+                    mcap = state.best_mcap if state else 0
+
+                    # Skip dust/dead pairs — if after 15s still no meaningful mcap, drop it
+                    if mcap < MIN_DISCOVERY_MCAP:
+                        continue
+
+                    await self._send_discovery(event)
+                    _last_send = time.time()
+                    now = _last_send
+                    _timestamps.append(_last_send)
+
+                # Cap pending buffer to prevent memory growth
+                if len(pending) > 200:
+                    pending = pending[-200:]
+
+                await asyncio.sleep(2)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -492,21 +525,27 @@ class SignalBot:
                 await asyncio.sleep(1)
 
     async def _send_discovery(self, event: dict):
-        """Send a lightweight new-pair discovery notification."""
+        """Send an enriched new-pair discovery notification."""
         token = event.get("token", "?")
         pool = event.get("pool", "")
         dex = event.get("dex", "?")
         fee = event.get("fee")
         hooks = event.get("hooks")
 
-        # Look up state for mcap/liq if available
+        # Look up enriched state
         state = self.tracker.get(token) if self.tracker else None
         mcap = state.best_mcap if state else 0
         liq = state.best_liquidity if state else 0
         name = state.token_name if state and state.token_name else ""
         symbol = state.token_symbol if state and state.token_symbol else ""
+        buys = state.best_buys if state else 0
+        sells = state.total_sells if state else 0
+        has_socials = state.has_socials if state else False
+        bytecode_safe = state.bytecode_safe if state else None
+        unique_buyers = len(state.unique_buyers) if state else 0
+        age_s = state.age_seconds if state else 0
 
-        # Header
+        # Header with name
         if name and symbol:
             title = f" {name} (${symbol})"
         elif symbol:
@@ -515,6 +554,17 @@ class SignalBot:
             title = f" {name}"
         else:
             title = ""
+
+        # Safety indicator
+        if bytecode_safe is True:
+            safety_tag = "✅"
+        elif bytecode_safe is False:
+            safety_tag = "⛔"
+        else:
+            safety_tag = "❓"
+
+        # Socials indicator
+        social_tag = "🌐" if has_socials else ""
 
         ds_link = f"https://dexscreener.com/base/{token}"
         explorer_link = f"https://basescan.org/token/{token}"
@@ -528,22 +578,40 @@ class SignalBot:
             ]
         }
 
-        # Info line
+        # Build info lines
         info_parts = [dex.upper()]
         if fee:
             info_parts.append(f"fee={fee}")
         if hooks:
-            info_parts.append(f"hooks={hooks[:10]}..")
-        if mcap > 0:
-            info_parts.append(f"mcap=${mcap:,.0f}")
-        if liq > 0:
-            info_parts.append(f"liq=${liq:,.0f}")
+            info_parts.append(f"hooks={hooks[:14]}..")
         info_str = " · ".join(info_parts)
+
+        # Metrics line
+        metrics_parts = []
+        if mcap > 0:
+            metrics_parts.append(f"💰 ${mcap:,.0f}")
+        if liq > 0:
+            metrics_parts.append(f"💧 ${liq:,.0f}")
+        if buys > 0:
+            metrics_parts.append(f"🟢 {buys}B/{sells}S")
+        if unique_buyers > 0:
+            metrics_parts.append(f"👥 {unique_buyers}")
+        metrics_str = "  ".join(metrics_parts)
+
+        # Status line
+        status_parts = [f"{safety_tag} safety"]
+        if social_tag:
+            status_parts.append(f"{social_tag} socials")
+        if age_s > 0:
+            status_parts.append(f"⏱ {age_s:.0f}s")
+        status_str = "  ".join(status_parts)
 
         message = (
             f"📡 <b>NEW PAIR</b>{title}\n"
             f"<code>{token}</code>\n"
-            f"{info_str}"
+            f"{info_str}\n"
+            f"{metrics_str}\n"
+            f"{status_str}"
         )
         await self._send_message(message, reply_markup=keyboard)
 

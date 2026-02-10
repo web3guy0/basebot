@@ -509,24 +509,29 @@ async def main():
     for sig in (signal_module.SIGINT, signal_module.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown(detector)))
 
-    endpoints = config.RPC_WSS_ENDPOINTS
+    import random
+    endpoints = list(config.RPC_WSS_ENDPOINTS)  # copy to avoid mutating config
+    random.shuffle(endpoints)  # randomize so restarts don't always hit the same first
     n_eps = len(endpoints)
     if n_eps > 1:
-        logger.info(f"WSS failover: {n_eps} endpoints configured")
+        logger.info(f"WSS failover: {n_eps} endpoints, order randomized")
 
-    # Retry with exponential backoff + endpoint rotation on failure
-    max_retries = 10 * n_eps  # more retries when more endpoints available
+    # Try each endpoint quickly (5s backoff) before slow retry cycles.
+    max_retries = 10 * n_eps
+    ep_index = 0  # tracks which endpoint to try next
+
     for attempt in range(1, max_retries + 1):
-        wss_url = endpoints[(attempt - 1) % n_eps]
+        wss_url = endpoints[ep_index]
         try:
             await detector.start(wss_url=wss_url)
             break  # Clean exit
         except Exception as e:
-            backoff = min(30 * ((attempt - 1) // n_eps + 1), 300)
-            next_url = endpoints[attempt % n_eps] if attempt < max_retries else None
-            switch_msg = (
-                f" → switching to {next_url[:50]}.." if next_url and n_eps > 1 else ""
-            )
+            # Quick retry on different endpoint first (5s), then slow backoff
+            cycle = (attempt - 1) // n_eps  # how many full rotations completed
+            backoff = min(5 + 25 * cycle, 300)  # 5s, 30s, 55s, ... up to 300s
+            ep_index = (ep_index + 1) % n_eps
+            next_url = endpoints[ep_index]
+            switch_msg = f" → trying {next_url[:50]}.." if n_eps > 1 else ""
             logger.error(
                 f"Connection failed on {wss_url[:50]}.. "
                 f"(attempt {attempt}/{max_retries}): {e}\n"
