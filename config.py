@@ -12,6 +12,14 @@ RPC_WSS = os.getenv("RPC_WSS", "wss://base-mainnet.g.alchemy.com/v2/YOUR_KEY")
 RPC_HTTP = os.getenv("RPC_HTTP", "https://mainnet.base.org")
 CHAIN_ID = 8453  # Base Mainnet
 
+# Multi-WSS failover: comma-separated list of WSS endpoints.
+# Bot tries each in order; on failure switches to next.
+# If not set, falls back to single RPC_WSS above.
+_wss_env = os.getenv("RPC_WSS_ENDPOINTS", "")
+RPC_WSS_ENDPOINTS: list[str] = [
+    url.strip() for url in _wss_env.split(",") if url.strip()
+] if _wss_env.strip() else [RPC_WSS]
+
 # ── Telegram (Based Bot — Telethon userbot) ─────────────────
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
@@ -25,6 +33,7 @@ BOT_CHAT_ID = os.getenv("BOT_CHAT_ID", "")
 
 # ── Signal Thresholds ──────────────────────────────────────────
 MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", "180"))
+MIN_MCAP_USD = float(os.getenv("MIN_MCAP_USD", "0"))  # Skip tokens below this mcap (0 = disabled)
 MAX_MCAP_USD = float(os.getenv("MAX_MCAP_USD", "30000"))
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "3000"))
 MIN_BUYS = int(os.getenv("MIN_BUYS", "2"))
@@ -45,10 +54,6 @@ MIN_UNIQUE_BUYERS = int(os.getenv("MIN_UNIQUE_BUYERS", "2"))
 # ── Whale Alert ────────────────────────────────────────────────
 # Minimum swap USD value to trigger a whale alert on tracked tokens
 WHALE_ALERT_MIN_USD = float(os.getenv("WHALE_ALERT_MIN_USD", "500"))
-
-# ── Volume Spike Scanner ──────────────────────────────────────
-# Detect old tokens suddenly getting volume spikes (piggybacks on V3 global Swap sub)
-VOLUME_SPIKE_ENABLED = os.getenv("VOLUME_SPIKE_ENABLED", "true").lower() == "true"
 
 # ── Discovery Feed ────────────────────────────────────────────
 # Shows every new WETH pair on personal bot (no auto-buy). Manual research.

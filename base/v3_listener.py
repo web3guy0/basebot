@@ -1,10 +1,12 @@
 """
 Uniswap V3 Factory + Pool listener.
-Subscribe to PoolCreated from Factory, then track Swap events on new WETH pools.
+Subscribe to PoolCreated from Factory; poll Swap events via eth_getLogs
+for tracked pools only (no global subscription).
 
-Uses web3 v7 handler-based subscription pattern.
-V3 Swaps: we subscribe globally to the Swap topic and filter client-side
-for pools we're tracking (since V3 emits swaps from individual pool contracts).
+V3 emits Swap logs from individual pool contracts, so a global topic-only
+subscription would stream EVERY V3 swap on Base (~200K+/day), burning through
+WSS credits.  Instead, we poll eth_getLogs every 2s for just the 10-50 pools
+we're actively tracking.  Cost: ~60 CU/call vs ~8M CU/day for global sub.
 """
 import asyncio
 import logging
@@ -24,48 +26,37 @@ logger = logging.getLogger("v3_listener")
 
 ALLOWED_FEE_TIERS = {3000, 10000}
 
+# Base L2 block time is ~2 seconds.  Poll slightly faster to ensure we don't
+# miss blocks even under jitter, but skip if no new block since last poll.
+POLL_INTERVAL_S = 2
+
 
 class V3Listener:
-    """Listens to V3 Factory for PoolCreated, then Swaps on new pools."""
+    """Listens to V3 Factory for PoolCreated, then polls Swaps on tracked pools."""
 
-    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, volume_scanner=None, discovery_queue=None):
+    def __init__(self, w3, state_tracker, signal_engine, eth_price_fn, whale_queue=None, discovery_queue=None):
         self.w3 = w3
         self.tracker = state_tracker
         self.engine = signal_engine
         self.eth_price_fn = eth_price_fn
         self.whale_queue = whale_queue
-        self.volume_scanner = volume_scanner
         self.discovery_queue = discovery_queue
         self.pool_to_token: dict[str, tuple[str, bool]] = {}  # pool_addr -> (token_addr, eth_is_token0)
         self._tracked_pools: set[str] = set()
+        self._last_polled_block: int = 0
 
     async def register_subscriptions(self):
-        """Register V3 Factory + global Swap subscriptions.
+        """Register V3 Factory PoolCreated subscription only.
+        Swap tracking is handled by poll_swaps() — no global swap subscription.
         Does NOT call handle_subscriptions — caller must do that after all subs are registered.
         """
-        logger.info(f"Registering V3 subscriptions on Factory {V3_FACTORY}")
+        logger.info(f"Registering V3 PoolCreated subscription on Factory {V3_FACTORY}")
 
         async def on_pool_created(ctx):
             try:
                 await self._handle_pool_created(ctx.result)
             except Exception as e:
                 logger.error(f"Error processing V3 PoolCreated: {e}")
-
-        async def on_swap(ctx):
-            try:
-                log = ctx.result
-                pool_addr = log["address"]
-                if hasattr(pool_addr, "lower"):
-                    pool_addr = pool_addr.lower()
-                else:
-                    pool_addr = str(pool_addr).lower()
-                # Record every swap for volume spike scanner (before filter)
-                if self.volume_scanner:
-                    self.volume_scanner.record_swap(pool_addr)
-                if pool_addr in self._tracked_pools:
-                    await self._handle_swap(log, pool_addr)
-            except Exception as e:
-                logger.error(f"Error processing V3 Swap: {e}")
 
         await self.w3.eth.subscribe(
             "logs",
@@ -74,13 +65,54 @@ class V3Listener:
             label="v3_pool_created",
         )
 
-        await self.w3.eth.subscribe(
-            "logs",
-            {"topics": [TOPIC_V3_SWAP]},
-            handler=on_swap,
-            label="v3_swap",
-        )
-        logger.info("V3 subscriptions registered (PoolCreated + Swap)")
+        # Store current block so poll_swaps starts from here
+        self._last_polled_block = await self.w3.eth.block_number
+        logger.info("V3 PoolCreated subscription registered (swaps via getLogs polling)")
+
+    # ── Swap polling loop ────────────────────────────────────────
+
+    async def poll_swaps(self):
+        """Poll eth_getLogs for Swap events on tracked pools.
+        Runs as a background task — replaces the global Swap subscription.
+        Cost: ~60 CU per getLogs call every 2s = ~2.6M CU/day (vs 8-14M for global sub).
+        """
+        logger.info("V3 swap polling active (getLogs for tracked pools only)")
+        while True:
+            try:
+                current_block = await self.w3.eth.block_number
+                if current_block <= self._last_polled_block:
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+
+                tracked = list(self._tracked_pools)
+                if not tracked:
+                    # No pools to track — just advance the cursor
+                    self._last_polled_block = current_block
+                    await asyncio.sleep(POLL_INTERVAL_S)
+                    continue
+
+                # Fetch swap logs for all tracked pools in one RPC call
+                # web3.py accepts a list of addresses in the filter
+                logs = await self.w3.eth.get_logs({
+                    "fromBlock": self._last_polled_block + 1,
+                    "toBlock": current_block,
+                    "address": [self.w3.to_checksum_address(p) for p in tracked],
+                    "topics": [TOPIC_V3_SWAP],
+                })
+
+                for log in logs:
+                    pool_addr = log["address"]
+                    if hasattr(pool_addr, "lower"):
+                        pool_addr = pool_addr.lower()
+                    else:
+                        pool_addr = str(pool_addr).lower()
+                    if pool_addr in self._tracked_pools:
+                        await self._handle_swap(log, pool_addr)
+
+                self._last_polled_block = current_block
+            except Exception as e:
+                logger.error(f"V3 swap poll error: {e}")
+            await asyncio.sleep(POLL_INTERVAL_S)
 
     async def _handle_pool_created(self, log):
         """New V3 pool. Filter for WETH pairs + allowed fee tiers."""

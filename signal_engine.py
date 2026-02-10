@@ -8,6 +8,7 @@ import logging
 import time
 
 import config
+from signal_journal import SignalJournal
 
 logger = logging.getLogger("signal")
 
@@ -46,6 +47,8 @@ class SignalEngine:
         }
         # Post-mortem records (filled async after 10 min)
         self.post_mortems: list[dict] = []
+        # Persistent signal journal (append-only JSONL file)
+        self.journal = SignalJournal()
 
     async def evaluate(self, state) -> bool:
         """
@@ -71,13 +74,16 @@ class SignalEngine:
             else config.MAX_TOKEN_AGE_SECONDS
         )
         if age > max_age:
-            self._reject(token, "too_old", f"age={age:.0f}s")
+            self._reject(token, "too_old", f"age={age:.0f}s", state)
             return False
 
-        # 2. Market cap ≤ 30,000 USD
+        # 2. Market cap ≤ MAX and ≥ MIN
         mcap = state.best_mcap
         if mcap > config.MAX_MCAP_USD and mcap > 0:
-            self._reject(token, "mcap_high", f"mcap=${mcap:.0f}")
+            self._reject(token, "mcap_high", f"mcap=${mcap:.0f}", state)
+            return False
+        if config.MIN_MCAP_USD > 0 and mcap > 0 and mcap < config.MIN_MCAP_USD:
+            self._reject(token, "mcap_low", f"mcap=${mcap:.0f}", state)
             return False
 
         # 3. Liquidity ≥ 3,000 USD
@@ -98,7 +104,7 @@ class SignalEngine:
             largest_buy_pct = 0
 
         if largest_buy_pct < config.MIN_LARGEST_BUY_PCT:
-            self._reject(token, "weak_buy", f"largest={largest_buy_pct:.1f}%")
+            self._reject(token, "weak_buy", f"largest={largest_buy_pct:.1f}%", state)
             return False
 
         # ── ANTI-SPAM GUARDS ──
@@ -109,7 +115,7 @@ class SignalEngine:
             t for t in self._signal_timestamps if now - t < 3600
         ]
         if len(self._signal_timestamps) >= config.MAX_SIGNALS_PER_HOUR:
-            self._reject(token, "rate_limited", "max signals/hour reached")
+            self._reject(token, "rate_limited", "max signals/hour reached", state)
             return False
 
         # Deployer spam check — reject if deployer launched too many tokens in 24h
@@ -122,17 +128,17 @@ class SignalEngine:
             )
             deployer_count = tracker.record_deployer(state.deployer_address, state.token_address) if tracker else 0
             if deployer_count > config.MAX_DEPLOYER_TOKENS_24H:
-                self._reject(token, "deployer_spam", f"deployer launched {deployer_count} tokens in 24h")
+                self._reject(token, "deployer_spam", f"deployer launched {deployer_count} tokens in 24h", state)
                 return False
 
         # Bytecode safety (non-blocking — only blocks if result available)
         if state.bytecode_safe is False:
-            self._reject(token, "unsafe_bytecode", "failed safety check")
+            self._reject(token, "unsafe_bytecode", "failed safety check", state)
             return False
 
         # Copycat filter — reject tokens impersonating established tokens
         if state.is_copycat:
-            self._reject(token, "copycat", f"name={state.token_symbol}")
+            self._reject(token, "copycat", f"name={state.token_symbol}", state)
             return False
 
         # Same-symbol cooldown — if we already signaled a token with this exact
@@ -141,12 +147,12 @@ class SignalEngine:
             sym_key = state.token_symbol.upper()
             last_signal_time = self._symbol_cooldowns.get(sym_key)
             if last_signal_time and now - last_signal_time < config.SAME_SYMBOL_COOLDOWN_S:
-                self._reject(token, "dup_symbol", f"${state.token_symbol} already signaled {now - last_signal_time:.0f}s ago")
+                self._reject(token, "dup_symbol", f"${state.token_symbol} already signaled {now - last_signal_time:.0f}s ago", state)
                 return False
 
         # Minimum unique buyers — require different wallets, not just total buys
         if len(state.unique_buyers) < config.MIN_UNIQUE_BUYERS:
-            self._reject(token, "few_unique_buyers", f"unique={len(state.unique_buyers)}")
+            self._reject(token, "few_unique_buyers", f"unique={len(state.unique_buyers)}", state)
             return False
 
         # No socials warning — don't reject, but track (useful for analysis)
@@ -156,7 +162,7 @@ class SignalEngine:
         # If DexScreener shows 0 sells with >5 buys, suspicious
         if state.ds_sells_m5 is not None and state.ds_buys_m5 is not None:
             if state.ds_buys_m5 > 5 and state.ds_sells_m5 == 0:
-                self._reject(token, "no_sells", "possible honeypot (0 sells)")
+                self._reject(token, "no_sells", "possible honeypot (0 sells)", state)
                 return False
 
         # ── SIGNAL TRIGGERED — mark permanently, one signal per token ──
@@ -165,7 +171,7 @@ class SignalEngine:
         time_to_signal = now - state.first_seen
         if config.MAX_SIGNAL_LATENCY_SECONDS > 0:
             if time_to_signal > config.MAX_SIGNAL_LATENCY_SECONDS:
-                self._reject(token, "too_slow", f"latency={time_to_signal:.0f}s")
+                self._reject(token, "too_slow", f"latency={time_to_signal:.0f}s", state)
                 return False
 
         state.signaled = True
@@ -209,14 +215,18 @@ class SignalEngine:
             f"{'═' * 55}"
         )
 
+        # Log to persistent journal
+        self.journal.log_signal(state)
+
         # Enqueue for Telegram
         await self.signal_queue.put(state.token_address)
         return True
 
-    def _reject(self, token: str, reason: str, detail: str = ""):
+    def _reject(self, token: str, reason: str, detail: str = "", state=None):
         """Track rejection reason for debugging."""
         self._reject_reasons[reason] = self._reject_reasons.get(reason, 0) + 1
         self.total_rejected += 1
+        self.journal.log_reject(token, reason, detail, state)
         if detail:
             logger.debug(f"[skip] {token[:10]}... {reason}: {detail}")
 

@@ -29,7 +29,6 @@ from dexscreener import DexScreenerClient, DexScreenerEnricher, SolDexScreenerEn
 from telegram_sender import TelegramSender
 from telegram_bot import SignalBot
 from post_mortem import PostMortemTracker
-from volume_scanner import VolumeScanner
 
 # Solana imports (conditional on SOL_ENABLED)
 if config.SOL_ENABLED:
@@ -174,8 +173,6 @@ class SignalDetector:
         self._personalbot_queue: asyncio.Queue[str] = asyncio.Queue()
         # Whale alert queue — large swaps on tracked tokens
         self._whale_queue: asyncio.Queue[dict] = asyncio.Queue()
-        # Pump / volume spike alert queue
-        self._pump_queue: asyncio.Queue[dict] = asyncio.Queue()
         # Discovery feed queue — every new WETH pair, personal bot only
         self._discovery_queue: asyncio.Queue[dict] = asyncio.Queue() if config.DISCOVERY_FEED_ENABLED else None
         self.signal_bot = SignalBot(
@@ -183,16 +180,8 @@ class SignalDetector:
             state_tracker=self.state_tracker,
             sol_state_tracker=self.sol_state_tracker,
             whale_queue=self._whale_queue,
-            pump_queue=self._pump_queue,
             discovery_queue=self._discovery_queue,
         )
-
-        # Volume spike scanner (piggybacks on V3 global swap subscription)
-        self.volume_scanner = VolumeScanner(
-            alert_queue=self._pump_queue,
-            dex_client=self._shared_dex_client,
-            signaled_history=self.engine.signaled_history,
-        ) if config.VOLUME_SPIKE_ENABLED else None
 
         self.w3 = None
         self._safety_checker = None
@@ -208,7 +197,9 @@ class SignalDetector:
                 self.sol_state_tracker, self.engine, client=self._shared_dex_client
             )
 
-    async def start(self):
+    async def start(self, wss_url: str | None = None):
+        """Start the detector. wss_url overrides the default RPC_WSS."""
+        rpc = wss_url or config.RPC_WSS
         mode = '\033[33mDRY RUN\033[0m' if config.DRY_RUN else '\033[31mLIVE\033[0m'
         sol = '+ Solana' if config.SOL_ENABLED else ''
         logger.info(
@@ -220,9 +211,9 @@ class SignalDetector:
             f"{'━' * 50}"
         )
 
-        logger.info(f"Connecting to {config.RPC_WSS[:40]}...")
+        logger.info(f"Connecting to {rpc[:50]}...")
 
-        async with AsyncWeb3(WebSocketProvider(config.RPC_WSS)) as w3:
+        async with AsyncWeb3(WebSocketProvider(rpc)) as w3:
             self.w3 = w3
 
             chain_id = await w3.eth.chain_id
@@ -241,7 +232,7 @@ class SignalDetector:
 
             # Build listeners (they share the same w3 + subscription manager)
             self._v4 = V4Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self._discovery_queue)
-            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self.volume_scanner, self._discovery_queue)
+            self._v3 = V3Listener(w3, self.state_tracker, self.engine, self.eth_oracle.get_price, self._whale_queue, self._discovery_queue)
 
             # Register all subscriptions (V4 + V3), then run handler once
             await self._v4.register_subscriptions()
@@ -264,13 +255,9 @@ class SignalDetector:
                 asyncio.create_task(self.post_mortem.start(), name="post_mortem"),
                 asyncio.create_task(self._signal_hook_loop(), name="signal_hook"),
                 asyncio.create_task(self._dump_monitor_loop(), name="dump_monitor"),
+                # V3 swap polling — replaces global swap subscription, saves ~70% credits
+                asyncio.create_task(self._v3.poll_swaps(), name="v3_swap_poll"),
             ]
-
-            # Volume spike scanner (optional)
-            if self.volume_scanner:
-                # Give scanner reference to new-token pools so it skips them
-                self.volume_scanner._new_token_pools = self._v3._tracked_pools
-                tasks.append(asyncio.create_task(self.volume_scanner.run(), name="volume_scanner"))
 
             logger.info("\u2713 All tasks launched. Listening...")
 
@@ -514,10 +501,6 @@ class SignalDetector:
             if stats["reject_reasons"]:
                 top = sorted(stats["reject_reasons"].items(), key=lambda x: -x[1])[:5]
                 logger.info(f"[stats] rejects: {dict(top)}")
-            if self.volume_scanner:
-                pools = len(self.volume_scanner._swaps)
-                spikes = self.volume_scanner._total_spikes
-                logger.info(f"[stats] scanner: pools={pools} spikes={spikes}")
 
 
 async def main():
@@ -526,20 +509,31 @@ async def main():
     for sig in (signal_module.SIGINT, signal_module.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown(detector)))
 
-    # Retry with exponential backoff on connection failure (429, network errors)
-    max_retries = 10
+    endpoints = config.RPC_WSS_ENDPOINTS
+    n_eps = len(endpoints)
+    if n_eps > 1:
+        logger.info(f"WSS failover: {n_eps} endpoints configured")
+
+    # Retry with exponential backoff + endpoint rotation on failure
+    max_retries = 10 * n_eps  # more retries when more endpoints available
     for attempt in range(1, max_retries + 1):
+        wss_url = endpoints[(attempt - 1) % n_eps]
         try:
-            await detector.start()
+            await detector.start(wss_url=wss_url)
             break  # Clean exit
         except Exception as e:
-            backoff = min(30 * attempt, 300)  # 30s, 60s, 90s... up to 5min
+            backoff = min(30 * ((attempt - 1) // n_eps + 1), 300)
+            next_url = endpoints[attempt % n_eps] if attempt < max_retries else None
+            switch_msg = (
+                f" → switching to {next_url[:50]}.." if next_url and n_eps > 1 else ""
+            )
             logger.error(
-                f"Connection failed (attempt {attempt}/{max_retries}): {e}\n"
-                f"Retrying in {backoff}s..."
+                f"Connection failed on {wss_url[:50]}.. "
+                f"(attempt {attempt}/{max_retries}): {e}\n"
+                f"Retrying in {backoff}s...{switch_msg}"
             )
             if attempt == max_retries:
-                logger.error("Max retries exceeded. Exiting.")
+                logger.error("Max retries on all endpoints exceeded. Exiting.")
                 sys.exit(1)
             await asyncio.sleep(backoff)
 

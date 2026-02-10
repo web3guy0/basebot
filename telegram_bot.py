@@ -32,7 +32,7 @@ class SignalBot:
     def __init__(self, signal_queue: asyncio.Queue, state_tracker=None, sol_state_tracker=None, whale_queue=None, pump_queue=None, discovery_queue=None):
         self.signal_queue = signal_queue
         self.whale_queue = whale_queue
-        self.pump_queue = pump_queue
+        self.pump_queue = pump_queue  # kept for interface compatibility (unused without volume scanner)
         self.discovery_queue = discovery_queue
         self.tracker = state_tracker
         self.sol_tracker = sol_state_tracker
